@@ -60,11 +60,19 @@ async function createServer() {
   // PRIORIDADE ABSOLUTA: Rotas JSON do Stremio & Nuvio (antes de Vite/Static)
   // =========================================================================
 
+  const resolveEffectiveConfigParam = (param: unknown): string | undefined => {
+    if (typeof param === 'string' && param.trim()) {
+      return param.trim();
+    }
+    const envDefault = process.env.DEFAULT_USER_CONFIG?.trim();
+    return envDefault || undefined;
+  };
+
   app.get(['/manifest.json', '/:config/manifest.json'], (req: Request, res: Response) => {
     setStremioJsonHeaders(res);
-    const configParam = typeof req.params.config === 'string' ? req.params.config : undefined;
-    if (configParam) {
-      const config = decodeConfigBase64Url(configParam);
+    const effectiveConfig = resolveEffectiveConfigParam(req.params.config);
+    if (effectiveConfig) {
+      const config = decodeConfigBase64Url(effectiveConfig);
       globalAddonWarmer.warmAddons(config.addons);
     }
     res.status(200).json(buildManifest());
@@ -72,7 +80,7 @@ async function createServer() {
 
   const handleStreamRequest = async (req: Request, res: Response) => {
     setStremioJsonHeaders(res);
-    const configParam = typeof req.params.config === 'string' ? req.params.config : undefined;
+    const effectiveConfig = resolveEffectiveConfigParam(req.params.config);
     const type = typeof req.params.type === 'string' ? req.params.type : '';
     const rawId = (typeof req.params.id === 'string' ? req.params.id : '').replace(/\.json$/i, '');
 
@@ -82,7 +90,7 @@ async function createServer() {
     }
 
     try {
-      const config = decodeConfigBase64Url(configParam);
+      const config = decodeConfigBase64Url(effectiveConfig);
       const result = await runStreamPipeline(config, type, rawId);
       res.status(200).json({ streams: result.streams });
     } catch (error) {
@@ -113,27 +121,30 @@ async function createServer() {
     res.json(result);
   });
 
-  app.get('/:config/debug-stream/:type/:id.json', async (req: Request, res: Response) => {
-    setStremioJsonHeaders(res);
-    const configParam = typeof req.params.config === 'string' ? req.params.config : undefined;
-    const type = typeof req.params.type === 'string' ? req.params.type : 'movie';
-    const rawId = (typeof req.params.id === 'string' ? req.params.id : '').replace(/\.json$/i, '');
+  app.get(
+    ['/debug-stream/:type/:id.json', '/:config/debug-stream/:type/:id.json'],
+    async (req: Request, res: Response) => {
+      setStremioJsonHeaders(res);
+      const effectiveConfig = resolveEffectiveConfigParam(req.params.config);
+      const type = typeof req.params.type === 'string' ? req.params.type : 'movie';
+      const rawId = (typeof req.params.id === 'string' ? req.params.id : '').replace(/\.json$/i, '');
 
-    const startedAt = Date.now();
-    try {
-      const config = decodeConfigBase64Url(configParam);
-      const result = await runStreamPipeline(config, type, rawId);
-      res.json({
-        durationMs: Date.now() - startedAt,
-        ...result,
-      });
-    } catch (error) {
-      res.status(500).json({
-        durationMs: Date.now() - startedAt,
-        error: error instanceof Error ? error.message : 'Erro desconhecido ao processar pipeline.',
-      });
-    }
-  });
+      const startedAt = Date.now();
+      try {
+        const config = decodeConfigBase64Url(effectiveConfig);
+        const result = await runStreamPipeline(config, type, rawId);
+        res.json({
+          durationMs: Date.now() - startedAt,
+          ...result,
+        });
+      } catch (error) {
+        res.status(500).json({
+          durationMs: Date.now() - startedAt,
+          error: error instanceof Error ? error.message : 'Erro desconhecido ao processar pipeline.',
+        });
+      }
+    },
+  );
 
   // Garante que nenhuma requisição .json caia no HTML do Vite/SPA
   app.get(/\.json$/i, (_req: Request, res: Response) => {

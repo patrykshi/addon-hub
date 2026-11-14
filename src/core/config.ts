@@ -225,7 +225,13 @@ export function sanitizeConfig(input: Partial<StreamHubConfig> | unknown): Strea
 
   const validResSet = new Set<ResolutionKey>(ALL_RESOLUTIONS);
   const resolutions: ResolutionKey[] = Array.isArray(raw.resolutions)
-    ? raw.resolutions.filter((r): r is ResolutionKey => typeof r === 'string' && validResSet.has(r as ResolutionKey))
+    ? Array.from(
+        new Set(
+          raw.resolutions.filter(
+            (r): r is ResolutionKey => typeof r === 'string' && validResSet.has(r as ResolutionKey),
+          ),
+        ),
+      )
     : [...DEFAULT_CONFIG.resolutions];
 
   const allowUnknownRes =
@@ -260,19 +266,36 @@ export function sanitizeConfig(input: Partial<StreamHubConfig> | unknown): Strea
   };
 }
 
+function isDefaultResolutions(resolutions: ResolutionKey[]): boolean {
+  return (
+    resolutions.length === ALL_RESOLUTIONS.length &&
+    ALL_RESOLUTIONS.every((res, idx) => resolutions[idx] === res)
+  );
+}
+
+function compactAddonUrl(url: string): string {
+  return url.replace(/^https:\/\//i, '').replace(/\/manifest\.json$/i, '');
+}
+
+function expandAddonUrl(shortUrl: string): string {
+  const trimmed = shortUrl.trim();
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  return normalizeManifestUrl(withScheme);
+}
+
 export function encodeConfigBase64Url(config: StreamHubConfig): string {
   const sanitized = sanitizeConfig(config);
+  // Schema v2 minificado: remove `logo`, usa chaves de 1 letra e omite defaults
   const compact: Record<string, unknown> = {
-    addons: sanitized.addons,
-    resolutions: sanitized.resolutions,
-    allowUnknownRes: sanitized.allowUnknownRes,
-    languageMode: sanitized.languageMode,
-    strictMetaMatch: sanitized.strictMetaMatch,
-    timeoutMs: sanitized.timeoutMs,
+    v: 2,
+    a: sanitized.addons.map((item) => [compactAddonUrl(item.url), item.name]),
+    r: isDefaultResolutions(sanitized.resolutions) ? undefined : sanitized.resolutions,
+    u: sanitized.allowUnknownRes === DEFAULT_CONFIG.allowUnknownRes ? undefined : sanitized.allowUnknownRes ? 1 : 0,
+    l: sanitized.languageMode === DEFAULT_CONFIG.languageMode ? undefined : sanitized.languageMode,
+    s: sanitized.strictMetaMatch === DEFAULT_CONFIG.strictMetaMatch ? undefined : sanitized.strictMetaMatch ? 1 : 0,
+    t: sanitized.timeoutMs === DEFAULT_CONFIG.timeoutMs ? undefined : sanitized.timeoutMs,
+    k: sanitized.tmdbApiKey || undefined,
   };
-  if (sanitized.tmdbApiKey) {
-    compact.tmdbApiKey = sanitized.tmdbApiKey;
-  }
   const json = JSON.stringify(compact);
   const bytes = new TextEncoder().encode(json);
   return bytesToBase64Url(bytes);
@@ -287,6 +310,57 @@ export function decodeConfigBase64Url(encoded?: string): StreamHubConfig {
     const bytes = base64UrlToBytes(encoded.trim());
     const json = new TextDecoder().decode(bytes);
     const parsed: unknown = JSON.parse(json);
+
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      (parsed as { v?: unknown }).v === 2 &&
+      Array.isArray((parsed as { a?: unknown }).a)
+    ) {
+      const v2 = parsed as {
+        v: number;
+        a: unknown[];
+        r?: unknown;
+        u?: unknown;
+        l?: unknown;
+        s?: unknown;
+        t?: unknown;
+        k?: unknown;
+      };
+
+      const expandedAddons: Array<{ url: string; name?: string }> = [];
+      for (const entry of v2.a) {
+        if (Array.isArray(entry) && typeof entry[0] === 'string' && entry[0].trim()) {
+          try {
+            expandedAddons.push({
+              url: expandAddonUrl(entry[0]),
+              name: typeof entry[1] === 'string' ? entry[1] : undefined,
+            });
+          } catch {
+            // Ignora entrada inválida individual
+          }
+        } else if (typeof entry === 'string' && entry.trim()) {
+          try {
+            expandedAddons.push({ url: expandAddonUrl(entry) });
+          } catch {
+            // Ignora entrada inválida individual
+          }
+        }
+      }
+
+      return sanitizeConfig({
+        addons: expandedAddons,
+        resolutions: Array.isArray(v2.r) ? v2.r : [...DEFAULT_CONFIG.resolutions],
+        allowUnknownRes:
+          v2.u === undefined ? DEFAULT_CONFIG.allowUnknownRes : Boolean(v2.u),
+        languageMode: typeof v2.l === 'string' ? v2.l : DEFAULT_CONFIG.languageMode,
+        strictMetaMatch:
+          v2.s === undefined ? DEFAULT_CONFIG.strictMetaMatch : Boolean(v2.s),
+        timeoutMs: typeof v2.t === 'number' ? v2.t : DEFAULT_CONFIG.timeoutMs,
+        tmdbApiKey: typeof v2.k === 'string' ? v2.k : DEFAULT_CONFIG.tmdbApiKey,
+      });
+    }
+
     return sanitizeConfig(parsed);
   } catch {
     return { ...DEFAULT_CONFIG, addons: [], resolutions: [...DEFAULT_CONFIG.resolutions] };
