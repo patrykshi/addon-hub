@@ -1,0 +1,6 @@
+{
+  "name": "StreamHub Lite",
+  "description": "Agregador inteligente de streams com validação anti-erros de metadados para Stremio e Nuvio",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

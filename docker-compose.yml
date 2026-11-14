@@ -1,0 +1,18 @@
+services:
+  streamhub-lite:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: streamhub-lite
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
