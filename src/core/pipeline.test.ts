@@ -175,16 +175,19 @@ test('runStreamPipeline bridges tmdb <-> tt alternate ID when primary returns 0 
   }
 });
 
-test('AddonWarmer identifies Render and Shardweb hosts accurately', () => {
+test('AddonWarmer identifies Render, Shardweb, DuckDNS, and FenixHub hosts accurately', () => {
   const warmer = new AddonWarmer();
   assert.equal(warmer.isColdStartHost('https://brazuca-play.onrender.com/manifest.json'), true);
   assert.equal(warmer.isColdStartHost('https://veyra.shardweb.app/manifest.json'), true);
+  assert.equal(warmer.isColdStartHost('https://meuaddon.duckdns.org/manifest.json'), true);
+  assert.equal(warmer.isColdStartHost('https://api.fenixhub.online/manifest.json'), true);
   assert.equal(warmer.isColdStartHost('https://torrentio.strem.fun/manifest.json'), false);
 });
 
-test('fetchWithFallback routes through CORS proxy on 403/503 and enforces 8000ms hard deadline', async () => {
-  assert.equal(HARD_GLOBAL_DEADLINE_MS, 8000);
+test('fetchWithFallback routes through CORS proxy on 403/503, enforces 8500ms hard deadline, and never calls proxy on timeout', async () => {
+  assert.equal(HARD_GLOBAL_DEADLINE_MS, 8500);
 
+  let proxyCalledOnTimeout = false;
   const server = http.createServer((req, res) => {
     const url = req.url || '';
     if (url.startsWith('/blocked')) {
@@ -192,9 +195,29 @@ test('fetchWithFallback routes through CORS proxy on 403/503 and enforces 8000ms
       res.end('Cloudflare 403');
       return;
     }
+    if (url.startsWith('/slow')) {
+      setTimeout(() => {
+        if (!res.writableEnded) {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ streams: [] }));
+        }
+      }, 800);
+      return;
+    }
     if (url.startsWith('/proxy?target=')) {
+      if (url.includes('slow')) proxyCalledOnTimeout = true;
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({ streams: [{ name: 'ProxyOK', title: 'HD', url: 'https://p.mp4' }] }));
+      return;
+    }
+    if (url.includes('cfg%7Cptbr')) {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ streams: [] }));
+      return;
+    }
+    if (url.includes('cfg|ptbr')) {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ streams: [{ name: 'Pipe200OK', title: 'HD', url: 'https://pipe.mp4' }] }));
       return;
     }
     res.statusCode = 404;
@@ -211,7 +234,54 @@ test('fetchWithFallback routes through CORS proxy on 403/503 and enforces 8000ms
       (u) => `http://127.0.0.1:${address.port}/proxy?target=${encodeURIComponent(u)}`,
     ]);
     assert.equal(result.viaProxy, true);
-    assert.deepEqual((result.data as { streams: unknown[] }).streams.length, 1);
+    assert.equal((result.data as { streams: unknown[] }).streams.length, 1);
+
+    await assert.rejects(() =>
+      fetchWithFallback(`http://127.0.0.1:${address.port}/slow`, 150, undefined, [
+        (u) => `http://127.0.0.1:${address.port}/proxy?target=${encodeURIComponent(u)}`,
+      ]),
+    );
+    assert.equal(proxyCalledOnTimeout, false);
+
+    const pipeSwapResult = await fetchAddonWithRetry(
+      `http://127.0.0.1:${address.port}/cfg%7Cptbr/stream/movie/tt0137523.json`,
+      2000,
+    );
+    assert.equal(pipeSwapResult.attempts, 2);
+    assert.equal(pipeSwapResult.streams.length, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('runStreamPipeline keeps ok: true when primary returns 200 OK empty and altId returns 404', async () => {
+  const server = http.createServer((req, res) => {
+    const url = req.url || '';
+    if (url.includes('/tt')) {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ streams: [] }));
+      return;
+    }
+    res.statusCode = 404;
+    res.end('Not Found');
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+
+  const config: StreamHubConfig = {
+    ...DEFAULT_CONFIG,
+    strictMetaMatch: false,
+    addons: [{ url: `http://127.0.0.1:${address.port}/manifest.json`, name: 'NTC TV' }],
+  };
+
+  try {
+    const result = await runStreamPipeline(config, 'movie', 'tt0137523', new StreamCache());
+    assert.equal(result.stats.addonResults.length, 1);
+    assert.equal(result.stats.addonResults[0].ok, true);
+    assert.equal(result.stats.addonResults[0].rawCount, 0);
+    assert.equal(result.stats.addonResults[0].error, undefined);
   } finally {
     server.close();
   }

@@ -74,7 +74,7 @@ async function createServer() {
     setStremioJsonHeaders(res);
     const configParam = typeof req.params.config === 'string' ? req.params.config : undefined;
     const type = typeof req.params.type === 'string' ? req.params.type : '';
-    const rawId = typeof req.params.id === 'string' ? req.params.id : '';
+    const rawId = (typeof req.params.id === 'string' ? req.params.id : '').replace(/\.json$/i, '');
 
     if (!type || !rawId) {
       res.status(400).json({ streams: [], error: 'Parâmetros type e id são obrigatórios.' });
@@ -117,7 +117,7 @@ async function createServer() {
     setStremioJsonHeaders(res);
     const configParam = typeof req.params.config === 'string' ? req.params.config : undefined;
     const type = typeof req.params.type === 'string' ? req.params.type : 'movie';
-    const rawId = typeof req.params.id === 'string' ? req.params.id : '';
+    const rawId = (typeof req.params.id === 'string' ? req.params.id : '').replace(/\.json$/i, '');
 
     const startedAt = Date.now();
     try {

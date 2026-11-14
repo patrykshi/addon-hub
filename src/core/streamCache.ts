@@ -18,8 +18,8 @@ export const sharedHttpsAgent = new https.Agent({
 export type ProxyUrlBuilder = (targetUrl: string) => string;
 
 export const DEFAULT_CORS_PROXIES: ProxyUrlBuilder[] = [
+  (targetUrl: string) => `https://corsproxy.io/?url=${encodeURIComponent(targetUrl)}`,
   (targetUrl: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
-  (targetUrl: string) => `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`,
 ];
 
 function isLocalUrl(rawUrl: string): boolean {
@@ -36,11 +36,50 @@ function isLocalUrl(rawUrl: string): boolean {
 }
 
 function shouldTryProxyFallback(error: unknown): boolean {
-  if (!axios.isAxiosError(error)) return true;
-  if (error.code === 'ERR_CANCELED') return false;
+  if (!axios.isAxiosError(error)) return false;
+  if (
+    error.code === 'ERR_CANCELED' ||
+    error.code === 'ECONNABORTED' ||
+    error.code === 'ETIMEDOUT'
+  ) {
+    // NUNCA acionar proxy se o servidor original deu timeout (evita multiplicar o tempo por 3x)
+    return false;
+  }
   const status = error.response?.status;
-  if (status === undefined) return true; // connection/DNS/TLS/timeout error
+  // Aciona proxy apenas em bloqueios de WAF/Cloudflare/Rate-Limit ou erro de TLS/Conexão rápida
+  if (status === undefined) {
+    return error.code === 'ECONNRESET' || error.code === 'EPROTO';
+  }
   return status === 403 || status === 503 || status === 429;
+}
+
+function isValidStremioPayload(data: unknown, targetUrl = ''): boolean {
+  if (!data) return false;
+  const isManifestRequest = /\/manifest\.json(?:$|\?)/i.test(targetUrl);
+
+  let resolved: unknown = data;
+  if (typeof resolved === 'string') {
+    const trimmed = resolved.trim();
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return false;
+    try {
+      resolved = JSON.parse(trimmed);
+    } catch {
+      return false;
+    }
+  }
+
+  if (Array.isArray(resolved)) return true;
+  if (resolved && typeof resolved === 'object') {
+    const obj = resolved as { streams?: unknown; id?: unknown; name?: unknown; resources?: unknown };
+    if (Array.isArray(obj.streams)) return true;
+    if (
+      isManifestRequest &&
+      (typeof obj.id === 'string' || typeof obj.name === 'string' || Array.isArray(obj.resources))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export async function fetchWithFallback(
@@ -63,26 +102,29 @@ export async function fetchWithFallback(
       throw directError;
     }
 
-    // Avoid sending localhost test URLs to external public proxies unless custom builders were supplied
     const usingDefaultProxies = proxyBuilders === DEFAULT_CORS_PROXIES;
     if (usingDefaultProxies && isLocalUrl(url)) {
       throw directError;
     }
+
+    const proxyTimeoutMs = Math.min(timeoutMs, 2600);
 
     for (const buildProxyUrl of proxyBuilders) {
       if (externalSignal?.aborted) break;
       try {
         const proxyUrl = buildProxyUrl(url);
         const proxyResponse = await axios.get<unknown>(proxyUrl, {
-          timeout: timeoutMs,
+          timeout: proxyTimeoutMs,
           signal: externalSignal,
           headers: STREMIO_CLIENT_HEADERS,
           httpAgent: sharedHttpAgent,
           httpsAgent: sharedHttpsAgent,
         });
-        return { data: proxyResponse.data, viaProxy: true };
+        if (isValidStremioPayload(proxyResponse.data, url)) {
+          return { data: proxyResponse.data, viaProxy: true };
+        }
       } catch {
-        // Try next proxy fallback
+        // Tenta o próximo proxy
       }
     }
 
@@ -115,9 +157,6 @@ export class StreamCache {
     return `${addonUrl}-${type}-${mediaId}`;
   }
 
-  /**
-   * Regra de Ouro: NUNCA armazena arrays vazios no cache.
-   */
   setSuccess(keys: string[], streams: RawAddonStream[], now = Date.now()): void {
     if (!Array.isArray(streams) || streams.length === 0) return;
 
@@ -168,8 +207,7 @@ export class StreamCache {
 
 export const globalStreamCache = new StreamCache();
 
-// Aquecedor (Pre-Warming / Keep-Alive) para hosts com Cold Start (Render e Shardweb)
-const WARMUP_HOST_SUBSTRINGS = ['onrender.com', 'shardweb.app'];
+const WARMUP_HOST_SUBSTRINGS = ['onrender.com', 'shardweb.app', 'duckdns.org', 'fenixhub.online'];
 const WARMUP_THROTTLE_MS = 4 * 60 * 1000;
 const WARMUP_TRACK_TTL_MS = 2 * 60 * 60 * 1000;
 
@@ -208,13 +246,13 @@ export class AddonWarmer {
     this.lastPingAt.set(url, now);
     try {
       await axios.get(url, {
-        timeout: 4000,
+        timeout: 4500,
         headers: STREMIO_CLIENT_HEADERS,
         httpAgent: sharedHttpAgent,
         httpsAgent: sharedHttpsAgent,
       });
     } catch {
-      // Ping de aquecimento silencioso (best-effort)
+      // Ping de aquecimento silencioso
     }
   }
 

@@ -68,44 +68,55 @@ export function extractAddonDisplayName(url: string, explicitName?: string): str
   const trimmed = explicitName?.trim();
   if (trimmed) return trimmed;
 
+  let host = '';
   try {
-    const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
-    if (host.includes('torrentio')) return 'Torrentio';
-    if (host.includes('comet')) return 'Comet';
-    if (host.includes('mediafusion')) return 'MediaFusion';
-    if (host.includes('nuvio')) return 'NuvioStreams';
-    if (host.includes('knightcrawler')) return 'KnightCrawler';
-    if (host.includes('annatar')) return 'Annatar';
-    if (host.includes('jackettio')) return 'Jackettio';
-    if (host.includes('stremthru')) return 'StremThru';
-
-    const firstLabel = host.split('.')[0] || 'Addon';
-    return firstLabel.charAt(0).toUpperCase() + firstLabel.slice(1);
+    host = new URL(url.replace(/\|/g, '%7C')).hostname.toLowerCase();
   } catch {
-    return 'Addon';
+    const match = url.match(/^https?:\/\/([^/:\s]+)/i);
+    host = match ? match[1].toLowerCase() : '';
   }
+
+  if (!host) return 'Addon';
+  if (host.includes('torrentio')) return 'Torrentio';
+  if (host.includes('comet')) return 'Comet';
+  if (host.includes('mediafusion')) return 'MediaFusion';
+  if (host.includes('nuvio')) return 'NuvioStreams';
+  if (host.includes('knightcrawler')) return 'KnightCrawler';
+  if (host.includes('annatar')) return 'Annatar';
+  if (host.includes('jackettio')) return 'Jackettio';
+  if (host.includes('stremthru')) return 'StremThru';
+  if (host.includes('fenixflix')) return 'FenixFlix';
+
+  const firstLabel = host.split('.')[0] || 'Addon';
+  return firstLabel.charAt(0).toUpperCase() + firstLabel.slice(1);
 }
 
 export function normalizeManifestUrl(rawUrl: string): string {
-  const trimmed = rawUrl.trim();
+  const trimmed = rawUrl.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
   if (!trimmed) {
     throw new Error('URL do addon vazia.');
   }
 
   const httpConverted = trimmed.replace(/^stremio:\/\//i, 'https://');
-  let parsed: URL;
+  const candidateForUrlCheck = httpConverted.replace(/\|/g, '%7C');
+  const basicHttpRegex = /^https?:\/\/[^/\s]+(?:\/.*)?$/i;
+
+  let isValid = false;
   try {
-    parsed = new URL(httpConverted);
+    const parsed = new URL(candidateForUrlCheck);
+    isValid = parsed.protocol === 'http:' || parsed.protocol === 'https:';
   } catch {
+    isValid = basicHttpRegex.test(httpConverted);
+  }
+
+  if (!isValid) {
+    if (/^[a-z]+:\/\//i.test(httpConverted) && !/^https?:\/\//i.test(httpConverted)) {
+      throw new Error('Protocolo não suportado. Use http://, https:// ou stremio://');
+    }
     throw new Error('URL inválida. Informe uma URL completa começando com https:// ou stremio://');
   }
 
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('Protocolo não suportado. Use http://, https:// ou stremio://');
-  }
-
-  // Preserva a codificação original do caminho de configuração (ex: | ou %7C)
+  // Preserva a codificação original do caminho de configuração (ex: | ou %7C, vírgulas e =)
   const qIndex = httpConverted.indexOf('?');
   const basePart = qIndex >= 0 ? httpConverted.slice(0, qIndex) : httpConverted;
   const queryPart = qIndex >= 0 ? httpConverted.slice(qIndex) : '';
@@ -130,7 +141,8 @@ export function getAddonStreamEndpoint(manifestUrl: string, type: string, id: st
   const baseWithoutQuery = qIndex >= 0 ? normalized.slice(0, qIndex) : normalized;
   const querySuffix = qIndex >= 0 ? normalized.slice(qIndex) : '';
   const cleanBaseUrl = baseWithoutQuery.replace(/\/manifest\.json$/i, '').replace(/\/+$/, '');
-  return `${cleanBaseUrl}/stream/${encodeURIComponent(type)}/${id}.json${querySuffix}`;
+  const cleanId = id.replace(/\.json$/i, '');
+  return `${cleanBaseUrl}/stream/${encodeURIComponent(type)}/${cleanId}.json${querySuffix}`;
 }
 
 export function swapPipeEncoding(url: string): string | null {

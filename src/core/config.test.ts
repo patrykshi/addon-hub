@@ -8,7 +8,7 @@ import {
   type StreamHubConfig,
 } from './config.ts';
 
-test('normalizeManifestUrl normalizes stremio://, base paths, and trailing slashes', () => {
+test('normalizeManifestUrl normalizes stremio://, base paths, trailing slashes, and complex FenixFlix config paths', () => {
   assert.equal(
     normalizeManifestUrl('stremio://torrentio.strem.fun/manifest.json'),
     'https://torrentio.strem.fun/manifest.json',
@@ -16,6 +16,18 @@ test('normalizeManifestUrl normalizes stremio://, base paths, and trailing slash
   assert.equal(
     normalizeManifestUrl('https://comet.elfhosted.com/'),
     'https://comet.elfhosted.com/manifest.json',
+  );
+  assert.equal(
+    normalizeManifestUrl(
+      'https://fenixflix.fenixhub.online/qualities=4k,1080p,720p,sd%7Caudio=dublado,legendado%7Ccatalogs=filmes,series/manifest.json',
+    ),
+    'https://fenixflix.fenixhub.online/qualities=4k,1080p,720p,sd%7Caudio=dublado,legendado%7Ccatalogs=filmes,series/manifest.json',
+  );
+  assert.equal(
+    normalizeManifestUrl(
+      'https://fenixflix.fenixhub.online/qualities=4k,1080p|audio=dublado/manifest.json',
+    ),
+    'https://fenixflix.fenixhub.online/qualities=4k,1080p|audio=dublado/manifest.json',
   );
   assert.throws(() => normalizeManifestUrl('not-a-url'));
 });
@@ -36,6 +48,10 @@ test('getAddonStreamEndpoint strips /manifest.json and keeps literal colons, pip
   assert.equal(
     getAddonStreamEndpoint('https://vetela.cc/addon/manifest.json?token=abc', 'movie', 'tt0137523'),
     'https://vetela.cc/addon/stream/movie/tt0137523.json?token=abc',
+  );
+  assert.equal(
+    getAddonStreamEndpoint('https://vetela.cc/addon/manifest.json', 'series', 'tt0903747:1:5.json'),
+    'https://vetela.cc/addon/stream/series/tt0903747:1:5.json',
   );
 });
 

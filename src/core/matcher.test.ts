@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import type { StreamHubConfig } from './config.ts';
 import {
   computeTokenOverlap,
+  getDedupeKey,
   isPtBrStream,
   normalizeTitle,
   processStreams,
@@ -244,13 +245,13 @@ test('Deduplication, PT-BR priority, Resolution sort, Debrid Cache tie-breaker, 
     },
   });
 
-  // Deduplicated from 5 to 4
+  // Deduplicated from 5 to 4, preserving combined addon badge for Torrentio + Comet
   assert.equal(out.length, 4);
   // 1st: PT-BR stream on top
   assert.equal(out[0].name, '⚡ [Comet] | 1080p | 🇧🇷');
   assert.equal(out[0].behaviorHints?.bingeGroup, 'comet-1080p');
-  // 2nd: 4K stream next
-  assert.equal(out[1].name, '⚡ [Torrentio] | 4K');
+  // 2nd: 4K stream next (Torrentio + Comet shared same infoHash)
+  assert.equal(out[1].name, '⚡ [Torrentio + Comet] | 4K');
   // 3rd: 1080p with debrid cache (⚡) beats non-cached 1080p
   assert.equal(out[2].name, '⚡ [MediaFusion] | 1080p');
   assert.equal(out[3].name, '⚡ [Torrentio] | 1080p');
@@ -348,4 +349,157 @@ test('Direct HTTP streams (without infoHash) are never discarded by strictMetaMa
     ],
   );
 });
+
+test('Direct HTTP streams with unknown resolution survive allowUnknownRes=false, fallback dedupe includes addonName, and description preserves original name/title', () => {
+  assert.notEqual(
+    getDedupeKey({ name: 'Player 1' }, 'Veyra'),
+    getDedupeKey({ name: 'Player 1' }, 'FenixFlix'),
+  );
+
+  const streams: RawAddonStream[] = [
+    {
+      addonName: 'Sessão Fechada',
+      stream: {
+        name: 'Player Principal Dublado',
+        url: 'https://sessao.example/play/1.mp4',
+      },
+    },
+    {
+      addonName: 'FenixFlix',
+      stream: {
+        name: 'Servidor Alternativo',
+      },
+    },
+    {
+      addonName: 'Zeus',
+      stream: {
+        name: 'Servidor Alternativo',
+      },
+    },
+  ];
+
+  const out = processStreams(
+    streams,
+    { ...baseConfig, allowUnknownRes: false, strictMetaMatch: true },
+    {
+      type: 'movie',
+      canonicalMeta: {
+        imdbId: 'tt0137523',
+        type: 'movie',
+        canonicalTitles: ['Fight Club'],
+        year: 1999,
+        fetchedAt: Date.now(),
+      },
+    },
+  );
+
+  assert.equal(out.length, 1);
+  assert.equal(out[0].name, '⚡ [Sessão Fechada] | Auto | 🇧🇷');
+  assert.equal(out[0].description, 'Player Principal Dublado');
+
+  const outWithFallback = processStreams(
+    streams.slice(1),
+    { ...baseConfig, allowUnknownRes: true, strictMetaMatch: false },
+    {
+      type: 'movie',
+      canonicalMeta: {
+        imdbId: 'tt0137523',
+        type: 'movie',
+        canonicalTitles: ['Fight Club'],
+        year: 1999,
+        fetchedAt: Date.now(),
+      },
+    },
+  );
+  assert.equal(outWithFallback.length, 2);
+  assert.deepEqual(
+    outWithFallback.map((s) => s.description),
+    ['Servidor Alternativo', 'Servidor Alternativo'],
+  );
+});
+
+test('Debrid URL streams with behaviorHints.filename and HTTP streams with explicit (YYYY) fail year mismatch, junk streams are dropped, and cross-addon dedupe merges addon names', () => {
+  const streams: RawAddonStream[] = [
+    // Torrentio TB with wrong year (2016) + filename -> must be REJECTED for Fight Club (1999)
+    {
+      addonName: 'Torrentio TB',
+      stream: {
+        name: '[TB+] Torrentio\n1080p',
+        title: "Clube da Luta ''Edição 10 Anos'' 1080p (2016)",
+        url: 'https://torbox.example/stream/wrong-2016.mkv',
+        behaviorHints: {
+          filename: 'Clube.da.Luta.Edicao.10.Anos.2016.1080p.WEB-DL.mkv',
+        },
+      },
+    },
+    // Generic HTTP stream with explicit wrong (2016) in title -> must be REJECTED for Fight Club (1999)
+    {
+      addonName: 'Veyra',
+      stream: {
+        name: 'Veyra 1080p',
+        title: 'Clube da Luta (2016) Dublado',
+        url: 'https://veyra.example/wrong-year.mp4',
+      },
+    },
+    // Junk/Action streams -> must be REJECTED
+    {
+      addonName: 'Sessão Fechada',
+      stream: {
+        name: 'Sessão Fechada',
+        title: 'Toque para dar nota 5 ao filme',
+        url: 'https://sessao.example/act/rate/movie/tt0137523',
+      },
+    },
+    {
+      addonName: 'Sessão Fechada',
+      stream: {
+        name: 'Sessão Fechada',
+        title: 'O áudio não era o anunciado na opção / Toque para avisar a administração',
+        url: 'https://sessao.example/act/rep/movie/tt0137523',
+      },
+    },
+    {
+      addonName: 'Sessão Fechada',
+      stream: {
+        name: 'Sessão Fechada',
+        title: 'Link que não abre ou não carrega',
+        url: 'https://sessao.example/ok-looking-url',
+      },
+    },
+    // Aggregator + Original addon sharing same direct URL -> must merge badge into [Sessão Fechada + VêTela Brasil]
+    {
+      addonName: 'Sessão Fechada',
+      stream: {
+        name: 'Sessão Fechada 720p',
+        title: '🎬 VêTela Brasil: link direto (Dublado)',
+        url: 'https://vetela.cc/video/fight-club-720p.mp4',
+      },
+    },
+    {
+      addonName: 'VêTela Brasil',
+      stream: {
+        name: 'VêTela Brasil HD',
+        title: 'Player Principal Dublado',
+        url: 'https://vetela.cc/video/fight-club-720p.mp4',
+      },
+    },
+  ];
+
+  const out = processStreams(streams, baseConfig, {
+    type: 'movie',
+    canonicalMeta: {
+      imdbId: 'tt0137523',
+      type: 'movie',
+      canonicalTitles: ['Fight Club', 'Clube da Luta'],
+      year: 1999,
+      fetchedAt: Date.now(),
+    },
+  });
+
+  assert.equal(out.length, 1);
+  assert.equal(out[0].name, '⚡ [Sessão Fechada + VêTela Brasil] | 720p | 🇧🇷');
+  assert.equal(out[0].url, 'https://vetela.cc/video/fight-club-720p.mp4');
+});
+
+
 

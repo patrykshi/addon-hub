@@ -1,7 +1,6 @@
 import axios from 'axios';
 import type { AddonEntry, StreamHubConfig } from './config.ts';
 import {
-  STREMIO_CLIENT_HEADERS,
   getAddonStreamEndpoint,
   swapPipeEncoding,
 } from './config.ts';
@@ -20,8 +19,9 @@ import {
   globalStreamCache,
 } from './streamCache.ts';
 
-export const HARD_GLOBAL_DEADLINE_MS = 8000;
+export const HARD_GLOBAL_DEADLINE_MS = 8500;
 export const ATTEMPT_TIMEOUT_MS = 3800;
+const METADATA_MAX_WAIT_MS = 2200;
 
 export interface StremioManifest {
   id: string;
@@ -133,7 +133,7 @@ function isRetryableFailure(error: unknown): { retry: boolean; isHttp400Or404: b
     return { retry: false, isHttp400Or404: true };
   }
   if (status !== undefined) {
-    return { retry: status >= 500 || status === 429, isHttp400Or404: false };
+    return { retry: status >= 500 || status === 429 || status === 403, isHttp400Or404: false };
   }
   return { retry: true, isHttp400Or404: false };
 }
@@ -153,6 +153,27 @@ export async function fetchAddonWithRetry(
 
   try {
     const { streams, viaProxy } = await executeSingle(url, attemptTimeoutMs);
+
+    // Se retornou 200 OK porém com 0 streams e a URL possui pipe (| ou %7C), testa a variante codificada/decodificada
+    if (streams.length === 0 && !externalSignal?.aborted) {
+      const swappedUrl = swapPipeEncoding(url);
+      if (swappedUrl) {
+        try {
+          const second = await executeSingle(swappedUrl, Math.min(attemptTimeoutMs, 2500));
+          if (second.streams.length > 0) {
+            return {
+              streams: second.streams,
+              endpointUsed: swappedUrl,
+              attempts: 2,
+              viaProxy: second.viaProxy,
+            };
+          }
+        } catch {
+          // Mantém resultado original vazio se o swap falhar
+        }
+      }
+    }
+
     return { streams, endpointUsed: url, attempts: 1, viaProxy };
   } catch (firstError) {
     if (externalSignal?.aborted) {
@@ -160,7 +181,7 @@ export async function fetchAddonWithRetry(
     }
 
     const classification = isRetryableFailure(firstError);
-    const swappedUrl = classification.isHttp400Or404 ? swapPipeEncoding(url) : null;
+    const swappedUrl = swapPipeEncoding(url);
 
     if (!classification.retry && !swappedUrl) {
       throw firstError;
@@ -195,7 +216,8 @@ export async function runStreamPipeline(
   streamCache: StreamCache = globalStreamCache,
 ): Promise<PipelineResult> {
   const pipelineStartedAt = Date.now();
-  const parsedId = parseRequestId(rawId);
+  const cleanRawId = rawId.replace(/\.json$/i, '');
+  const parsedId = parseRequestId(cleanRawId);
 
   if (config.addons.length === 0) {
     return {
@@ -213,19 +235,28 @@ export async function runStreamPipeline(
     };
   }
 
-  // Camada 5: Aquecimento não-bloqueante para hosts Render / Shardweb
+  // Camada 5: Aquecimento não-bloqueante
   globalAddonWarmer.warmAddons(config.addons);
 
-  // Trava rígida de tempo: máximo 8000ms no servidor mesmo se config pedir 30000ms
-  const safeTimeout = Math.min(Math.max(1000, config.timeoutMs || 6500), HARD_GLOBAL_DEADLINE_MS);
+  // Trava rígida de tempo para não estourar o timeout nativo do Stremio/Nuvio
+  const safeTimeout = Math.min(Math.max(1500, config.timeoutMs || 6500), HARD_GLOBAL_DEADLINE_MS);
   const globalDeadlineMs = safeTimeout;
-  const perAttemptTimeoutMs = Math.min(ATTEMPT_TIMEOUT_MS, Math.max(1000, Math.floor(safeTimeout * 0.5)));
+  const perAttemptTimeoutMs = Math.min(ATTEMPT_TIMEOUT_MS, Math.max(1500, Math.floor(safeTimeout * 0.5)));
 
   const deadlineController = new AbortController();
   let deadlineReached = false;
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 
-  // Estágio 1: Resolução de Metadados + Ponte Dupla de IDs (tt <-> tmdb)
+  const fallbackEmptyMeta: CanonicalMetadata = {
+    imdbId: parsedId.cleanId,
+    tmdbId: parsedId.cleanId.startsWith('tmdb:') ? parsedId.cleanId.replace(/^tmdb:/i, '') : undefined,
+    type,
+    canonicalTitles: [],
+    year: undefined,
+    fetchedAt: Date.now(),
+  };
+
+  // Estágio 1: Resolução de Metadados protegida por timeout curto (nunca trava os addons)
   const shouldFetchMetadata =
     config.strictMetaMatch ||
     Boolean(config.tmdbApiKey) ||
@@ -233,33 +264,22 @@ export async function runStreamPipeline(
     parsedId.cleanId.startsWith('tmdb:') ||
     parsedId.cleanId.startsWith('tt');
 
-  const metadataPromise: Promise<CanonicalMetadata> = shouldFetchMetadata
-    ? fetchCanonicalMetadata(type, parsedId.cleanId, config.tmdbApiKey)
-    : Promise.resolve({
-        imdbId: parsedId.cleanId,
-        type,
-        canonicalTitles: [],
-        year: undefined,
-        fetchedAt: Date.now(),
-      });
-
-  // Se o ID já veio como tmdb:, aguarda brevemente a ponte tmdb -> tt antes do fan-out principal
-  let initialMeta: CanonicalMetadata | null = null;
-  if (parsedId.cleanId.startsWith('tmdb:')) {
-    initialMeta = await Promise.race([
-      metadataPromise,
-      new Promise<CanonicalMetadata>((resolve) =>
-        setTimeout(
-          () =>
-            resolve({
-              imdbId: parsedId.cleanId,
-              tmdbId: parsedId.cleanId.replace(/^tmdb:/i, ''),
-              type,
-              canonicalTitles: [],
-              fetchedAt: Date.now(),
-            }),
-          2500,
+  const safeMetadataPromise: Promise<CanonicalMetadata> = shouldFetchMetadata
+    ? Promise.race([
+        fetchCanonicalMetadata(type, parsedId.cleanId, config.tmdbApiKey).catch(() => fallbackEmptyMeta),
+        new Promise<CanonicalMetadata>((resolve) =>
+          setTimeout(() => resolve(fallbackEmptyMeta), METADATA_MAX_WAIT_MS),
         ),
+      ])
+    : Promise.resolve(fallbackEmptyMeta);
+
+  // Se o ID veio como tmdb:, aguarda até 1.5s pela ponte tmdb -> tt antes de disparar os addons
+  let resolvedMeta: CanonicalMetadata | null = null;
+  if (parsedId.cleanId.startsWith('tmdb:')) {
+    resolvedMeta = await Promise.race([
+      safeMetadataPromise,
+      new Promise<CanonicalMetadata>((resolve) =>
+        setTimeout(() => resolve(fallbackEmptyMeta), 1500),
       ),
     ]);
   }
@@ -271,15 +291,7 @@ export async function runStreamPipeline(
 
   const runAddonTask = async (addon: AddonEntry, index: number): Promise<void> => {
     const addonStartedAt = Date.now();
-    const initialBridge = buildIdBridgeCandidates(
-      parsedId,
-      initialMeta ?? {
-        imdbId: parsedId.cleanId,
-        type,
-        canonicalTitles: [],
-        fetchedAt: Date.now(),
-      },
-    );
+    const initialBridge = buildIdBridgeCandidates(parsedId, resolvedMeta ?? fallbackEmptyMeta);
 
     const initialCacheKeys = buildCacheKeysForAddon(addon.url, initialBridge.cacheIds);
     const freshHit = streamCache.getFresh(initialCacheKeys);
@@ -304,6 +316,8 @@ export async function runStreamPipeline(
 
     const primaryEndpoint = getAddonStreamEndpoint(addon.url, type, initialBridge.primaryId);
     let lastEndpoint = primaryEndpoint;
+    let primaryUrlUsed = primaryEndpoint;
+    let primarySucceededEmpty = false;
     let lastError: string | undefined;
 
     try {
@@ -313,14 +327,15 @@ export async function runStreamPipeline(
         deadlineController.signal,
       );
       lastEndpoint = firstResult.endpointUsed;
+      primaryUrlUsed = firstResult.endpointUsed;
 
       if (firstResult.streams.length > 0) {
         const mapped = firstResult.streams.map((stream) => ({
           addonName: addon.name,
           stream,
         }));
-        const resolvedMeta = initialMeta ?? (await metadataPromise);
-        const fullBridge = buildIdBridgeCandidates(parsedId, resolvedMeta);
+        const currentMeta = resolvedMeta ?? (await safeMetadataPromise);
+        const fullBridge = buildIdBridgeCandidates(parsedId, currentMeta);
         streamCache.setSuccess(buildCacheKeysForAddon(addon.url, fullBridge.cacheIds), mapped);
 
         settledOutcomes[index] = {
@@ -337,60 +352,63 @@ export async function runStreamPipeline(
         return;
       }
 
-      // Se retornou 0 streams no ID primário, tenta o ID alternativo da ponte tt <-> tmdb
-      const elapsedSoFar = Date.now() - pipelineStartedAt;
-      if (!deadlineController.signal.aborted && elapsedSoFar < globalDeadlineMs - 1000) {
-        const resolvedMeta = initialMeta ?? (await metadataPromise);
-        const fullBridge = buildIdBridgeCandidates(parsedId, resolvedMeta);
-        const allCacheKeys = buildCacheKeysForAddon(addon.url, fullBridge.cacheIds);
+      primarySucceededEmpty = true;
+    } catch (err) {
+      lastError = formatAxiosFailureReason(err, perAttemptTimeoutMs);
+    }
 
-        for (const altId of fullBridge.alternateIds) {
-          if (altId === initialBridge.primaryId) continue;
-          const remainingMs = globalDeadlineMs - (Date.now() - pipelineStartedAt);
-          if (remainingMs < 900 || deadlineController.signal.aborted) break;
+    // Se retornou 0 streams OU falhou no ID primário, tenta imediatamente os IDs alternativos (tt <-> tmdb)
+    const elapsedSoFar = Date.now() - pipelineStartedAt;
+    if (!deadlineController.signal.aborted && elapsedSoFar < globalDeadlineMs - 800) {
+      const currentMeta = resolvedMeta ?? (await safeMetadataPromise);
+      const fullBridge = buildIdBridgeCandidates(parsedId, currentMeta);
+      const allCacheKeys = buildCacheKeysForAddon(addon.url, fullBridge.cacheIds);
 
-          const altEndpoint = getAddonStreamEndpoint(addon.url, type, altId);
-          lastEndpoint = altEndpoint;
-          try {
-            const altResult = await fetchAddonWithRetry(
-              altEndpoint,
-              Math.min(perAttemptTimeoutMs, remainingMs - 200),
-              deadlineController.signal,
-            );
-            lastEndpoint = altResult.endpointUsed;
-            if (altResult.streams.length > 0) {
-              const mapped = altResult.streams.map((stream) => ({
-                addonName: addon.name,
-                stream,
-              }));
-              streamCache.setSuccess(allCacheKeys, mapped);
-              settledOutcomes[index] = {
-                streams: mapped,
-                diagnostic: {
-                  name: addon.name,
-                  url: addon.url,
-                  endpoint: lastEndpoint,
-                  ok: true,
-                  rawCount: mapped.length,
-                  durationMs: Date.now() - addonStartedAt,
-                  usedAltId: altId,
-                },
-              };
-              return;
-            }
-          } catch (altErr) {
+      for (const altId of fullBridge.alternateIds) {
+        if (altId === initialBridge.primaryId) continue;
+        const remainingMs = globalDeadlineMs - (Date.now() - pipelineStartedAt);
+        if (remainingMs < 700 || deadlineController.signal.aborted) break;
+
+        const altEndpoint = getAddonStreamEndpoint(addon.url, type, altId);
+        lastEndpoint = altEndpoint;
+        try {
+          const altResult = await fetchAddonWithRetry(
+            altEndpoint,
+            Math.min(perAttemptTimeoutMs, remainingMs - 150),
+            deadlineController.signal,
+          );
+          lastEndpoint = altResult.endpointUsed;
+          if (altResult.streams.length > 0) {
+            const mapped = altResult.streams.map((stream) => ({
+              addonName: addon.name,
+              stream,
+            }));
+            streamCache.setSuccess(allCacheKeys, mapped);
+            settledOutcomes[index] = {
+              streams: mapped,
+              diagnostic: {
+                name: addon.name,
+                url: addon.url,
+                endpoint: lastEndpoint,
+                ok: true,
+                rawCount: mapped.length,
+                durationMs: Date.now() - addonStartedAt,
+                usedAltId: altId,
+              },
+            };
+            return;
+          }
+        } catch (altErr) {
+          if (!primarySucceededEmpty) {
             lastError = formatAxiosFailureReason(altErr, perAttemptTimeoutMs);
           }
         }
       }
-    } catch (err) {
-      lastError = formatAxiosFailureReason(err, perAttemptTimeoutMs);
-      console.warn(`[StreamHub Lite] Addon "${addon.name}" (${lastEndpoint}) falhou: ${lastError}`);
     }
 
-    // Regra de Ouro do Cache: NUNCA salvar vazio; tentar fallback de cache stale se existir
-    const resolvedMeta = initialMeta ?? (await metadataPromise);
-    const fullBridge = buildIdBridgeCandidates(parsedId, resolvedMeta);
+    // Fallback de Cache (Stale) caso o addon tenha oscilado
+    const currentMeta = resolvedMeta ?? (await safeMetadataPromise);
+    const fullBridge = buildIdBridgeCandidates(parsedId, currentMeta);
     const fallbackHit = streamCache.getFallback(
       buildCacheKeysForAddon(addon.url, fullBridge.cacheIds),
     );
@@ -404,12 +422,27 @@ export async function runStreamPipeline(
         diagnostic: {
           name: addon.name,
           url: addon.url,
-          endpoint: lastEndpoint,
+          endpoint: primarySucceededEmpty ? primaryUrlUsed : lastEndpoint,
           ok: true,
           rawCount: fallbackHit.streams.length,
           durationMs: Date.now() - addonStartedAt,
           fromCache: true,
-          error: lastError ? `${lastError} (usando cache)` : undefined,
+          error: !primarySucceededEmpty && lastError ? `${lastError} (usando cache)` : undefined,
+        },
+      };
+      return;
+    }
+
+    if (primarySucceededEmpty) {
+      settledOutcomes[index] = {
+        streams: [],
+        diagnostic: {
+          name: addon.name,
+          url: addon.url,
+          endpoint: primaryUrlUsed,
+          ok: true,
+          rawCount: 0,
+          durationMs: Date.now() - addonStartedAt,
         },
       };
       return;
@@ -442,24 +475,7 @@ export async function runStreamPipeline(
   await Promise.race([Promise.allSettled(addonTasks), deadlinePromise]);
   if (deadlineTimer) clearTimeout(deadlineTimer);
 
-  const canonicalMeta =
-    initialMeta ??
-    (await Promise.race([
-      metadataPromise,
-      new Promise<CanonicalMetadata>((resolve) =>
-        setTimeout(
-          () =>
-            resolve({
-              imdbId: parsedId.cleanId,
-              type,
-              canonicalTitles: [],
-              fetchedAt: Date.now(),
-            }),
-          300,
-        ),
-      ),
-    ]));
-
+  const canonicalMeta = await safeMetadataPromise;
   const fullBridge = buildIdBridgeCandidates(parsedId, canonicalMeta);
   const rawStreams: RawAddonStream[] = [];
   const addonResults: AddonFetchDiagnostic[] = [];
@@ -478,7 +494,6 @@ export async function runStreamPipeline(
       continue;
     }
 
-    // Addon não concluiu antes do deadline global de 9500ms -> tenta fallback de cache
     const cacheKeys = buildCacheKeysForAddon(addon.url, fullBridge.cacheIds);
     const fallbackHit = streamCache.getFallback(cacheKeys);
     const endpoint = getAddonStreamEndpoint(addon.url, type, fullBridge.primaryId);
@@ -513,7 +528,7 @@ export async function runStreamPipeline(
     }
   }
 
-  // Estágio 3 + Estágio 4
+  // Estágio 3 + Estágio 4: Filtragem e Ordenação
   const streams = processStreams(rawStreams, config, {
     type,
     canonicalMeta,

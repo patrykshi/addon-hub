@@ -59,6 +59,9 @@ const DEBRID_CACHE_REGEX =
   /(\+|⚡|\[RD\+\]|\[TB\+\]|\[AD\+\]|\[PM\+\]|\[DL\+\]|\binstant\b|\bcached\b)/i;
 const TORRENT_SCENE_REGEX =
   /\b(x264|x265|h\.?264|h\.?265|hevc|avc|bluray|blu-ray|bdrip|brrip|web-?dl|webrip|hdrip|hdtv|dvdrip|remux)\b|\.(mkv|mp4|avi|mov|ts)\b/i;
+const JUNK_ACTION_URL_REGEX = /\/(act\/rate|act\/rep|report|rate)\//i;
+const JUNK_ACTION_TEXT_REGEX =
+  /(toque para dar nota|m[eé]dia do grupo aparecer|toque para avisar a administra|o [aá]udio n[aã]o era o anunciado|link que n[aã]o abre ou n[aã]o carrega|aviso importante|manuten[cç][aã]o|servidor offline)/i;
 
 const RESOLUTION_RANK: Record<ResolutionKey | 'unknown', number> = {
   '2160p': 4,
@@ -210,19 +213,58 @@ export function hasTorrentReleaseStructure(rawText: string, parsed: ParsedReleas
   return false;
 }
 
+export function isJunkOrActionStream(stream: StremioStream, rawText: string): boolean {
+  const urls = [stream.url, stream.externalUrl].filter(
+    (u): u is string => typeof u === 'string' && u.length > 0,
+  );
+  if (urls.some((u) => JUNK_ACTION_URL_REGEX.test(u))) {
+    return true;
+  }
+  return JUNK_ACTION_TEXT_REGEX.test(rawText);
+}
+
+function extractParenthesizedYears(text: string): number[] {
+  const years: number[] = [];
+  const regex = /\(((?:19|20)\d{2})\)/g;
+  for (const match of text.matchAll(regex)) {
+    const year = Number.parseInt(match[1], 10);
+    if (Number.isFinite(year)) {
+      years.push(year);
+    }
+  }
+  return years;
+}
+
 export function passesStrictMetaMatch(
   stream: StremioStream,
   parsed: ParsedRelease,
   rawText: string,
   context: MatchContext,
 ): FilterEvaluation {
-  // Streams HTTP diretas (sem infoHash) nunca são descartadas pelo strictMetaMatch;
-  // o filtro estrito de título/ano/episódio aplica-se apenas a torrents (infoHash).
-  if (stream.url && !stream.infoHash) {
-    return { pass: true };
+  const { type, canonicalMeta, reqSeason, reqEpisode } = context;
+
+  const hasInfoHash = Boolean(typeof stream.infoHash === 'string' && stream.infoHash.trim());
+  const hasFilename = Boolean(
+    typeof stream.behaviorHints?.filename === 'string' && stream.behaviorHints.filename.trim(),
+  );
+  const titleAndDesc = `${stream.title || ''} ${stream.description || ''}`;
+  const explicitYears = extractParenthesizedYears(titleAndDesc);
+
+  // Mesmo em links HTTP diretos sem filename, se houver ano explícito entre parênteses no filme (ex: (2016)),
+  // ele deve bater com o ano canônico (+/- 1 ano).
+  if (type === 'movie' && canonicalMeta.year !== undefined && explicitYears.length > 0) {
+    if (!explicitYears.some((y) => Math.abs(y - canonicalMeta.year!) <= 1)) {
+      return {
+        pass: false,
+        reason: `explicit_year_mismatch:${explicitYears[0]}!=${canonicalMeta.year}`,
+      };
+    }
   }
 
-  const { type, canonicalMeta, reqSeason, reqEpisode } = context;
+  // Só pula o strictMetaMatch completo se for link HTTP direto genérico SEM infoHash E SEM behaviorHints.filename
+  if (stream.url && !hasInfoHash && !hasFilename) {
+    return { pass: true };
+  }
 
   // Trava 1: Trava de Ano (apenas para movie)
   if (type === 'movie' && parsed.year !== undefined && canonicalMeta.year !== undefined) {
@@ -328,7 +370,7 @@ export function formatResolutionLabel(resolution: ResolutionKey | 'unknown'): st
   return resolution;
 }
 
-export function getDedupeKey(stream: StremioStream): string {
+export function getDedupeKey(stream: StremioStream, addonName = ''): string {
   if (stream.infoHash && typeof stream.infoHash === 'string' && stream.infoHash.trim()) {
     return `ih:${stream.infoHash.trim().toLowerCase()}-${stream.fileIdx ?? 0}`;
   }
@@ -341,7 +383,7 @@ export function getDedupeKey(stream: StremioStream): string {
   if (stream.ytId && typeof stream.ytId === 'string' && stream.ytId.trim()) {
     return `yt:${stream.ytId.trim()}`;
   }
-  return `fallback:${stream.name || ''}|${stream.title || ''}|${stream.description || ''}`;
+  return `fallback:${addonName}|${stream.name || ''}|${stream.title || ''}|${stream.description || ''}`;
 }
 
 export function formatStreamName(
@@ -358,6 +400,7 @@ export function formatStreamName(
 
 interface ProcessedCandidate {
   stream: StremioStream;
+  addonNames: string[];
   ptbr: boolean;
   resolution: ResolutionKey | 'unknown';
   debridCached: boolean;
@@ -388,7 +431,7 @@ export function processStreams(
   config: StreamHubConfig,
   context: MatchContext,
 ): StremioStream[] {
-  const seenKeys = new Set<string>();
+  const acceptedByKey = new Map<string, ProcessedCandidate>();
   const allowedRes = new Set<ResolutionKey>(config.resolutions);
   const candidates: ProcessedCandidate[] = [];
 
@@ -397,6 +440,11 @@ export function processStreams(
     if (!stream || typeof stream !== 'object') continue;
 
     const rawText = buildRawStreamText(stream);
+
+    if (isJunkOrActionStream(stream, rawText)) {
+      continue;
+    }
+
     const parsed = parseStreamRelease(stream);
 
     if (config.strictMetaMatch) {
@@ -406,15 +454,10 @@ export function processStreams(
       }
     }
 
-    const dedupeKey = getDedupeKey(stream);
-    if (seenKeys.has(dedupeKey)) {
-      continue;
-    }
-    seenKeys.add(dedupeKey);
-
+    const isDirectHttpStream = Boolean(stream.url && !stream.infoHash);
     const resolution = normalizeResolution(parsed.resolution, rawText);
     if (resolution === 'unknown') {
-      if (!config.allowUnknownRes) continue;
+      if (!config.allowUnknownRes && !isDirectHttpStream) continue;
     } else if (!allowedRes.has(resolution)) {
       continue;
     }
@@ -426,22 +469,52 @@ export function processStreams(
 
     const debridCached = isDebridCached(stream);
 
+    const dedupeKey = getDedupeKey(stream, addonName);
+    const existing = acceptedByKey.get(dedupeKey);
+    if (existing) {
+      if (addonName && !existing.addonNames.includes(addonName)) {
+        existing.addonNames.push(addonName);
+        existing.stream.name = formatStreamName(
+          existing.addonNames.join(' + '),
+          existing.resolution,
+          existing.ptbr,
+        );
+      }
+      if (!existing.debridCached && debridCached) {
+        existing.debridCached = true;
+      }
+      continue;
+    }
+
+    const originalName = typeof stream.name === 'string' ? stream.name.trim() : '';
+    const existingDesc = typeof stream.description === 'string' ? stream.description.trim() : '';
+    const existingTitle = typeof stream.title === 'string' ? stream.title.trim() : '';
+
+    const addonNames = addonName ? [addonName] : ['Addon'];
+
     const formattedStream: StremioStream = {
       ...stream,
-      name: formatStreamName(addonName, resolution, ptbr),
+      name: formatStreamName(addonNames.join(' + '), resolution, ptbr),
+      description: existingDesc || existingTitle || (originalName ? originalName : undefined),
       behaviorHints: stream.behaviorHints ? { ...stream.behaviorHints } : undefined,
     };
+    if (formattedStream.description === undefined) {
+      delete formattedStream.description;
+    }
     if (formattedStream.behaviorHints === undefined) {
       delete formattedStream.behaviorHints;
     }
 
-    candidates.push({
+    const candidate: ProcessedCandidate = {
       stream: formattedStream,
+      addonNames,
       ptbr,
       resolution,
       debridCached,
       originalIndex: i,
-    });
+    };
+    acceptedByKey.set(dedupeKey, candidate);
+    candidates.push(candidate);
   }
 
   candidates.sort((a, b) => compareCandidates(a, b, config.languageMode));
