@@ -1,0 +1,206 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: default-deny all unspecified paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidProfileId(id) {
+      return id is string && id.size() >= 20 && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidUserAccount(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'defaultProfileId', 'createdAt', 'updatedAt'])
+        && data.uid is string
+        && data.uid == userId
+        && data.uid == request.auth.uid
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 320
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 100
+        && (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500))
+        && (!('defaultProfileId' in data) || (data.defaultProfileId is string && data.defaultProfileId.size() == 0) || isValidProfileId(data.defaultProfileId))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserSecret(data, userId) {
+      return data.keys().hasAll(['ownerId', 'tmdbApiKey', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'tmdbApiKey', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.tmdbApiKey is string
+        && data.tmdbApiKey.size() <= 128
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStreamProfile(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'name',
+          'addons',
+          'resolutions',
+          'allowUnknownRes',
+          'languageMode',
+          'strictMetaMatch',
+          'timeoutMs',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'name',
+          'addons',
+          'resolutions',
+          'allowUnknownRes',
+          'languageMode',
+          'strictMetaMatch',
+          'timeoutMs',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.ownerId is string
+        && data.ownerId == request.auth.uid
+        && data.name is string
+        && data.name.size() >= 1
+        && data.name.size() <= 60
+        && data.addons is list
+        && data.addons.size() <= 40
+        && (
+          data.addons.size() == 0
+          || (
+            data.addons[0] is map
+            && data.addons[0].keys().hasAll(['url', 'name'])
+            && data.addons[0].keys().hasOnly(['url', 'name', 'logo'])
+            && data.addons[0].url is string
+            && data.addons[0].url.size() >= 8
+            && data.addons[0].url.size() <= 2048
+            && data.addons[0].name is string
+            && data.addons[0].name.size() >= 1
+            && data.addons[0].name.size() <= 64
+          )
+        )
+        && data.resolutions is list
+        && data.resolutions.size() <= 4
+        && data.resolutions.hasOnly(['2160p', '1080p', '720p', '480p'])
+        && data.allowUnknownRes is bool
+        && data.languageMode is string
+        && data.languageMode in ['prioritize_ptbr', 'only_ptbr', 'none']
+        && data.strictMetaMatch is bool
+        && data.timeoutMs is number
+        && data.timeoutMs >= 1000
+        && data.timeoutMs <= 30000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'photoURL', 'defaultProfileId', 'updatedAt']);
+      allow delete: if false;
+
+      match /secrets/{secretId} {
+        allow get: if isValidId(userId)
+          && isValidId(secretId)
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow list: if false;
+        allow create: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(secretId)
+          && isOwner(userId)
+          && isValidUserSecret(incoming(), userId)
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(secretId)
+          && isOwner(userId)
+          && isValidUserSecret(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['tmdbApiKey', 'updatedAt'])
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow delete: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(secretId)
+          && isOwner(userId);
+      }
+    }
+
+    match /profiles/{profileId} {
+      // Single-document lookup by unguessable profileId (contains no PII or API secrets) for Stremio/Nuvio players
+      allow get: if isValidProfileId(profileId);
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isVerifiedUser()
+        && isValidProfileId(profileId)
+        && isValidStreamProfile(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidProfileId(profileId)
+        && existing().ownerId == request.auth.uid
+        && isValidStreamProfile(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name',
+          'addons',
+          'resolutions',
+          'allowUnknownRes',
+          'languageMode',
+          'strictMetaMatch',
+          'timeoutMs',
+          'updatedAt'
+        ]);
+      allow delete: if isVerifiedUser()
+        && isValidProfileId(profileId)
+        && existing().ownerId == request.auth.uid;
+    }
+  }
+}

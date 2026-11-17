@@ -28,6 +28,12 @@ export const TopBar: React.FC<TopBarProps> = ({ onGenerateClick }) => {
 
         <nav aria-label="Navegação principal" className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
           <a
+            href="#perfis"
+            className="hover:text-white transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded-sm"
+          >
+            Perfis
+          </a>
+          <a
             href="#addons"
             className="hover:text-white transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded-sm"
           >

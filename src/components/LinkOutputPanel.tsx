@@ -1,16 +1,18 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Check, Copy, ExternalLink, Play, RefreshCw } from 'lucide-react';
 import type { StremioStream } from '../core/matcher.ts';
+import type { AddonFetchDiagnostic } from '../core/pipeline.ts';
 
 interface LinkOutputPanelProps {
   encodedConfig: string | null;
+  activeProfileId: string | null;
+  activeProfileName?: string;
   hasAddons: boolean;
   validationError: string;
   onGenerate: () => void;
   isDirtySinceGenerate: boolean;
+  hasUnsavedProfileChanges?: boolean;
 }
-
-import type { AddonFetchDiagnostic } from '../core/pipeline.ts';
 
 interface DebugStreamResponse {
   durationMs: number;
@@ -29,11 +31,17 @@ interface DebugStreamResponse {
 
 export const LinkOutputPanel: React.FC<LinkOutputPanelProps> = ({
   encodedConfig,
+  activeProfileId,
+  activeProfileName,
   hasAddons,
   validationError,
   onGenerate,
   isDirtySinceGenerate,
+  hasUnsavedProfileChanges = false,
 }) => {
+  const [linkMode, setLinkMode] = useState<'profile' | 'stateless'>(
+    activeProfileId ? 'profile' : 'stateless',
+  );
   const [copied, setCopied] = useState(false);
   const [testOpen, setTestOpen] = useState(false);
   const [testType, setTestType] = useState<'movie' | 'series'>('movie');
@@ -42,12 +50,34 @@ export const LinkOutputPanel: React.FC<LinkOutputPanelProps> = ({
   const [testResult, setTestResult] = useState<DebugStreamResponse | null>(null);
   const [testError, setTestError] = useState('');
 
+  useEffect(() => {
+    if (activeProfileId) {
+      setLinkMode('profile');
+    } else {
+      setLinkMode('stateless');
+    }
+  }, [activeProfileId]);
+
   const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
-  const manifestHttpUrl = encodedConfig ? `${origin}/${encodedConfig}/manifest.json` : '';
-  const manifestStremioUrl = encodedConfig
+  const usingProfileLink = Boolean(activeProfileId) && linkMode === 'profile';
+
+  const manifestHttpUrl = usingProfileLink && activeProfileId
+    ? `${origin}/p/${activeProfileId}/manifest.json`
+    : encodedConfig
+      ? `${origin}/${encodedConfig}/manifest.json`
+      : '';
+
+  const manifestStremioUrl = manifestHttpUrl
     ? manifestHttpUrl.replace(/^https?:\/\//i, 'stremio://')
     : '';
-  const editConfigureUrl = encodedConfig ? `/${encodedConfig}/configure` : '';
+
+  const editConfigureUrl = usingProfileLink && activeProfileId
+    ? `/p/${activeProfileId}/configure`
+    : encodedConfig
+      ? `/${encodedConfig}/configure`
+      : '';
+
+  const hasReadyOutput = Boolean(manifestHttpUrl);
 
   const handleCopy = async () => {
     if (!manifestHttpUrl) return;
@@ -71,7 +101,7 @@ export const LinkOutputPanel: React.FC<LinkOutputPanelProps> = ({
 
   const handleRunTest = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!encodedConfig) return;
+    if (!hasReadyOutput) return;
     const trimmed = testId.trim();
     if (!trimmed) {
       setTestError('Informe um ID válido (ex: tt0137523 ou tt0903747:1:5).');
@@ -83,9 +113,11 @@ export const LinkOutputPanel: React.FC<LinkOutputPanelProps> = ({
     setTestResult(null);
 
     try {
-      const response = await fetch(
-        `/${encodedConfig}/debug-stream/${encodeURIComponent(testType)}/${encodeURIComponent(trimmed)}.json`,
-      );
+      const debugPath = usingProfileLink && activeProfileId
+        ? `/p/${activeProfileId}/debug-stream/${encodeURIComponent(testType)}/${encodeURIComponent(trimmed)}.json`
+        : `/${encodedConfig}/debug-stream/${encodeURIComponent(testType)}/${encodeURIComponent(trimmed)}.json`;
+
+      const response = await fetch(debugPath);
       const data = (await response.json()) as DebugStreamResponse;
       if (!response.ok || data.error) {
         setTestError(data.error || 'Falha ao consultar o pipeline.');
@@ -110,23 +142,57 @@ export const LinkOutputPanel: React.FC<LinkOutputPanelProps> = ({
           03. Gerador de Links
         </h2>
         <p className="mt-1 text-sm text-slate-400">
-          Sua configuração é codificada em Base64URL diretamente no link, sem banco de dados.
+          Use o link permanente do seu perfil salvo ou um link Stateless em Base64URL.
         </p>
       </div>
 
       <div className="mt-5 space-y-4">
-        <button
-          type="button"
-          onClick={onGenerate}
-          className="flex min-h-[46px] w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 py-3 text-sm font-semibold text-white transition-colors hover:bg-blue-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-[#111723] cursor-pointer"
-        >
-          <RefreshCw className="h-4 w-4 shrink-0" aria-hidden="true" />
-          <span>
-            {encodedConfig && isDirtySinceGenerate
-              ? 'Atualizar Configuração'
-              : 'Gerar Configuração'}
-          </span>
-        </button>
+        {activeProfileId && (
+          <div className="flex items-center gap-1 rounded-lg bg-[#0B0F17] p-1 border border-white/[0.06]">
+            <button
+              type="button"
+              onClick={() => setLinkMode('profile')}
+              className={`flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                linkMode === 'profile'
+                  ? 'bg-blue-600 text-white'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Link Permanente (Perfil)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setLinkMode('stateless');
+                if (!encodedConfig && hasAddons) {
+                  onGenerate();
+                }
+              }}
+              className={`flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                linkMode === 'stateless'
+                  ? 'bg-blue-600 text-white'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Stateless (Base64URL)
+            </button>
+          </div>
+        )}
+
+        {(!usingProfileLink || !activeProfileId) && (
+          <button
+            type="button"
+            onClick={onGenerate}
+            className="flex min-h-[46px] w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 py-3 text-sm font-semibold text-white transition-colors hover:bg-blue-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-[#111723] cursor-pointer"
+          >
+            <RefreshCw className="h-4 w-4 shrink-0" aria-hidden="true" />
+            <span>
+              {encodedConfig && isDirtySinceGenerate
+                ? 'Atualizar Link Stateless'
+                : 'Gerar Link Stateless'}
+            </span>
+          </button>
+        )}
 
         {validationError && (
           <p role="alert" className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs font-medium text-red-300">
@@ -134,13 +200,19 @@ export const LinkOutputPanel: React.FC<LinkOutputPanelProps> = ({
           </p>
         )}
 
-        {encodedConfig && isDirtySinceGenerate && (
+        {usingProfileLink && hasUnsavedProfileChanges && (
           <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3.5 py-2 text-xs text-amber-200">
-            Você alterou opções após gerar o link. Clique em &ldquo;Atualizar Configuração&rdquo; para refletir as mudanças na URL.
+            Você editou este perfil. Clique em &ldquo;Atualizar Perfil&rdquo; no topo para sincronizar o link permanente com o Nuvio/Stremio.
           </p>
         )}
 
-        {!encodedConfig ? (
+        {!usingProfileLink && encodedConfig && isDirtySinceGenerate && (
+          <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3.5 py-2 text-xs text-amber-200">
+            Você alterou opções após gerar o link. Clique em &ldquo;Atualizar Link Stateless&rdquo; para refletir as mudanças na URL.
+          </p>
+        )}
+
+        {!hasReadyOutput ? (
           <div className="border-t border-white/[0.07] pt-5 pb-2 text-center">
             <p className="text-sm font-medium text-slate-300">
               {hasAddons
@@ -148,14 +220,16 @@ export const LinkOutputPanel: React.FC<LinkOutputPanelProps> = ({
                 : 'Adicione pelo menos 1 addon para começar'}
             </p>
             <p className="mt-1 text-xs text-slate-500">
-              Clique em &ldquo;Gerar Configuração&rdquo; para criar os links compatíveis com Nuvio e Stremio.
+              Salve um perfil na nuvem para obter uma URL permanente ou gere um link Stateless.
             </p>
           </div>
         ) : (
           <div className="space-y-4 pt-1">
             <div>
               <label htmlFor="generated-manifest-url" className="block text-xs font-medium text-slate-300 mb-1.5">
-                URL do Manifesto (HTTP / Stateless)
+                {usingProfileLink
+                  ? `URL Permanente${activeProfileName ? ` · ${activeProfileName}` : ''}`
+                  : 'URL do Manifesto (HTTP / Stateless)'}
               </label>
               <input
                 id="generated-manifest-url"
@@ -165,6 +239,11 @@ export const LinkOutputPanel: React.FC<LinkOutputPanelProps> = ({
                 onFocus={(e) => e.currentTarget.select()}
                 className="w-full min-h-[44px] rounded-lg border border-white/[0.1] bg-[#0B0F17] px-3.5 py-2 font-mono text-xs text-blue-300 focus:border-blue-500 focus:outline-none"
               />
+              {usingProfileLink && (
+                <p className="mt-1.5 text-[11px] text-slate-400">
+                  Instale esta URL uma única vez no Nuvio/Stremio. Futuras edições neste perfil atualizam seus addons automaticamente.
+                </p>
+              )}
             </div>
 
             <div className="space-y-2.5">

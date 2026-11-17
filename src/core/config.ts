@@ -128,6 +128,32 @@ export function normalizeManifestUrl(rawUrl: string): string {
   return `${withManifest}${queryPart}`;
 }
 
+export function prepareUpdatedAddonEntry(
+  existingAddons: AddonEntry[],
+  oldUrl: string,
+  rawNewUrl: string,
+  rawNewName?: string,
+): AddonEntry {
+  const normalizedUrl = normalizeManifestUrl(rawNewUrl);
+  const isDuplicate = existingAddons.some(
+    (item) => item.url !== oldUrl && item.url === normalizedUrl,
+  );
+  if (isDuplicate) {
+    throw new Error('Este addon já está na sua lista.');
+  }
+
+  const previous = existingAddons.find((item) => item.url === oldUrl);
+  const trimmedName = rawNewName?.trim();
+  const entry: AddonEntry = {
+    url: normalizedUrl,
+    name: extractAddonDisplayName(normalizedUrl, trimmedName),
+  };
+  if (normalizedUrl === oldUrl && previous?.logo) {
+    entry.logo = previous.logo;
+  }
+  return entry;
+}
+
 export const STREMIO_CLIENT_HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',

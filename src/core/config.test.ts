@@ -5,6 +5,7 @@ import {
   encodeConfigBase64Url,
   getAddonStreamEndpoint,
   normalizeManifestUrl,
+  prepareUpdatedAddonEntry,
   type StreamHubConfig,
 } from './config.ts';
 
@@ -152,4 +153,51 @@ test('decodeConfigBase64Url falls back safely on malformed input', () => {
   assert.equal(decoded.strictMetaMatch, true);
   assert.equal(decoded.timeoutMs, 6500);
   assert.deepEqual(decoded.addons, []);
+});
+
+test('prepareUpdatedAddonEntry updates HTTPS URL, prevents duplicates, and clears stale logo when URL changes', () => {
+  const existing = [
+    {
+      url: 'https://antigo.example/manifest.json',
+      name: 'Addon Antigo',
+      logo: 'https://antigo.example/logo.png',
+    },
+    {
+      url: 'https://torrentio.strem.fun/manifest.json',
+      name: 'Torrentio',
+    },
+  ];
+
+  const updated = prepareUpdatedAddonEntry(
+    existing,
+    'https://antigo.example/manifest.json',
+    'https://novo-mirror.example/',
+    'Novo Mirror',
+  );
+  assert.deepEqual(updated, {
+    url: 'https://novo-mirror.example/manifest.json',
+    name: 'Novo Mirror',
+  });
+
+  const renamedOnly = prepareUpdatedAddonEntry(
+    existing,
+    'https://antigo.example/manifest.json',
+    'https://antigo.example/manifest.json',
+    'Nome Editado',
+  );
+  assert.deepEqual(renamedOnly, {
+    url: 'https://antigo.example/manifest.json',
+    name: 'Nome Editado',
+    logo: 'https://antigo.example/logo.png',
+  });
+
+  assert.throws(
+    () =>
+      prepareUpdatedAddonEntry(
+        existing,
+        'https://antigo.example/manifest.json',
+        'https://torrentio.strem.fun',
+      ),
+    /já está na sua lista/,
+  );
 });

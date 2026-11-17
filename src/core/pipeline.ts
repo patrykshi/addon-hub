@@ -21,7 +21,9 @@ import {
 
 export const HARD_GLOBAL_DEADLINE_MS = 8500;
 export const ATTEMPT_TIMEOUT_MS = 3800;
-const METADATA_MAX_WAIT_MS = 2200;
+const METADATA_MAX_WAIT_MS = 1500;
+const RESPONSE_CACHE_TTL_MS = 90_000;
+const RESPONSE_CACHE_MAX_ENTRIES = 1000;
 
 export interface StremioManifest {
   id: string;
@@ -209,15 +211,41 @@ export interface PipelineResult {
   };
 }
 
+interface AggregatedCacheEntry {
+  result: PipelineResult;
+  cachedAt: number;
+}
+
+const aggregatedResponseCache = new Map<string, AggregatedCacheEntry>();
+const inFlightPipelines = new Map<string, Promise<PipelineResult>>();
+
+function buildPipelineFlightKey(config: StreamHubConfig, type: string, cleanRawId: string): string {
+  const addonsSig = config.addons.map((a) => `${a.url}|${a.name}`).join(';');
+  const resSig = config.resolutions.join(',');
+  return [
+    type,
+    cleanRawId,
+    addonsSig,
+    resSig,
+    config.allowUnknownRes ? '1' : '0',
+    config.languageMode,
+    config.strictMetaMatch ? '1' : '0',
+    String(config.timeoutMs),
+    config.tmdbApiKey ? 'k' : '',
+  ].join('::');
+}
+
+export function clearPipelineResponseCache(): void {
+  aggregatedResponseCache.clear();
+}
+
 export async function runStreamPipeline(
   config: StreamHubConfig,
   type: string,
   rawId: string,
   streamCache: StreamCache = globalStreamCache,
 ): Promise<PipelineResult> {
-  const pipelineStartedAt = Date.now();
   const cleanRawId = rawId.replace(/\.json$/i, '');
-  const parsedId = parseRequestId(cleanRawId);
 
   if (config.addons.length === 0) {
     return {
@@ -235,54 +263,74 @@ export async function runStreamPipeline(
     };
   }
 
-  // Camada 5: Aquecimento não-bloqueante
-  globalAddonWarmer.warmAddons(config.addons);
+  const useGlobalCoalescing = streamCache === globalStreamCache;
+  const flightKey = useGlobalCoalescing
+    ? buildPipelineFlightKey(config, type, cleanRawId)
+    : '';
 
-  // Trava rígida de tempo para não estourar o timeout nativo do Stremio/Nuvio
-  const safeTimeout = Math.min(Math.max(1500, config.timeoutMs || 6500), HARD_GLOBAL_DEADLINE_MS);
-  const globalDeadlineMs = safeTimeout;
-  const perAttemptTimeoutMs = Math.min(ATTEMPT_TIMEOUT_MS, Math.max(1500, Math.floor(safeTimeout * 0.5)));
-
-  const deadlineController = new AbortController();
-  let deadlineReached = false;
-  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-
-  const fallbackEmptyMeta: CanonicalMetadata = {
-    imdbId: parsedId.cleanId,
-    tmdbId: parsedId.cleanId.startsWith('tmdb:') ? parsedId.cleanId.replace(/^tmdb:/i, '') : undefined,
-    type,
-    canonicalTitles: [],
-    year: undefined,
-    fetchedAt: Date.now(),
-  };
-
-  // Estágio 1: Resolução de Metadados protegida por timeout curto (nunca trava os addons)
-  const shouldFetchMetadata =
-    config.strictMetaMatch ||
-    Boolean(config.tmdbApiKey) ||
-    Boolean(process.env.TMDB_API_KEY) ||
-    parsedId.cleanId.startsWith('tmdb:') ||
-    parsedId.cleanId.startsWith('tt');
-
-  const safeMetadataPromise: Promise<CanonicalMetadata> = shouldFetchMetadata
-    ? Promise.race([
-        fetchCanonicalMetadata(type, parsedId.cleanId, config.tmdbApiKey).catch(() => fallbackEmptyMeta),
-        new Promise<CanonicalMetadata>((resolve) =>
-          setTimeout(() => resolve(fallbackEmptyMeta), METADATA_MAX_WAIT_MS),
-        ),
-      ])
-    : Promise.resolve(fallbackEmptyMeta);
-
-  // Se o ID veio como tmdb:, aguarda até 1.5s pela ponte tmdb -> tt antes de disparar os addons
-  let resolvedMeta: CanonicalMetadata | null = null;
-  if (parsedId.cleanId.startsWith('tmdb:')) {
-    resolvedMeta = await Promise.race([
-      safeMetadataPromise,
-      new Promise<CanonicalMetadata>((resolve) =>
-        setTimeout(() => resolve(fallbackEmptyMeta), 1500),
-      ),
-    ]);
+  if (useGlobalCoalescing) {
+    const cached = aggregatedResponseCache.get(flightKey);
+    if (cached && Date.now() - cached.cachedAt <= RESPONSE_CACHE_TTL_MS) {
+      return cached.result;
+    }
+    const existingFlight = inFlightPipelines.get(flightKey);
+    if (existingFlight) {
+      return existingFlight;
+    }
   }
+
+  const executePipeline = async (): Promise<PipelineResult> => {
+    const pipelineStartedAt = Date.now();
+    const parsedId = parseRequestId(cleanRawId);
+
+    // Camada 5: Aquecimento não-bloqueante
+    globalAddonWarmer.warmAddons(config.addons);
+
+    // Trava rígida de tempo para não estourar o timeout nativo do Stremio/Nuvio
+    const safeTimeout = Math.min(Math.max(1500, config.timeoutMs || 6500), HARD_GLOBAL_DEADLINE_MS);
+    const globalDeadlineMs = safeTimeout;
+    const perAttemptTimeoutMs = Math.min(ATTEMPT_TIMEOUT_MS, Math.max(1500, Math.floor(safeTimeout * 0.5)));
+
+    const deadlineController = new AbortController();
+    let deadlineReached = false;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const fallbackEmptyMeta: CanonicalMetadata = {
+      imdbId: parsedId.cleanId,
+      tmdbId: parsedId.cleanId.startsWith('tmdb:') ? parsedId.cleanId.replace(/^tmdb:/i, '') : undefined,
+      type,
+      canonicalTitles: [],
+      year: undefined,
+      fetchedAt: Date.now(),
+    };
+
+    // Estágio 1: Resolução de Metadados protegida por timeout curto (nunca trava os addons)
+    const shouldFetchMetadata =
+      config.strictMetaMatch ||
+      Boolean(config.tmdbApiKey) ||
+      Boolean(process.env.TMDB_API_KEY) ||
+      parsedId.cleanId.startsWith('tmdb:') ||
+      parsedId.cleanId.startsWith('tt');
+
+    const safeMetadataPromise: Promise<CanonicalMetadata> = shouldFetchMetadata
+      ? Promise.race([
+          fetchCanonicalMetadata(type, parsedId.cleanId, config.tmdbApiKey).catch(() => fallbackEmptyMeta),
+          new Promise<CanonicalMetadata>((resolve) =>
+            setTimeout(() => resolve(fallbackEmptyMeta), METADATA_MAX_WAIT_MS),
+          ),
+        ])
+      : Promise.resolve(fallbackEmptyMeta);
+
+    // Se o ID veio como tmdb:, aguarda até 900ms pela ponte tmdb -> tt antes de disparar os addons
+    let resolvedMeta: CanonicalMetadata | null = null;
+    if (parsedId.cleanId.startsWith('tmdb:')) {
+      resolvedMeta = await Promise.race([
+        safeMetadataPromise,
+        new Promise<CanonicalMetadata>((resolve) =>
+          setTimeout(() => resolve(fallbackEmptyMeta), 900),
+        ),
+      ]);
+    }
 
   const settledOutcomes: Array<AddonFetchOutcome | undefined> = new Array(config.addons.length);
 
@@ -334,9 +382,12 @@ export async function runStreamPipeline(
           addonName: addon.name,
           stream,
         }));
-        const currentMeta = resolvedMeta ?? (await safeMetadataPromise);
-        const fullBridge = buildIdBridgeCandidates(parsedId, currentMeta);
-        streamCache.setSuccess(buildCacheKeysForAddon(addon.url, fullBridge.cacheIds), mapped);
+        // Grava imediatamente no cache sem bloquear aguardando metadados externos
+        streamCache.setSuccess(buildCacheKeysForAddon(addon.url, initialBridge.cacheIds), mapped);
+        void safeMetadataPromise.then((currentMeta) => {
+          const fullBridge = buildIdBridgeCandidates(parsedId, currentMeta);
+          streamCache.setSuccess(buildCacheKeysForAddon(addon.url, fullBridge.cacheIds), mapped);
+        });
 
         settledOutcomes[index] = {
           streams: mapped,
@@ -536,19 +587,42 @@ export async function runStreamPipeline(
     reqEpisode: parsedId.reqEpisode,
   });
 
-  return {
-    streams,
-    stats: {
-      addonsQueried: config.addons.length,
-      addonsSucceeded,
-      rawCount: rawStreams.length,
-      finalCount: streams.length,
-      canonicalTitles: canonicalMeta.canonicalTitles,
-      canonicalYear: canonicalMeta.year,
-      imdbId: canonicalMeta.imdbId,
-      tmdbId: canonicalMeta.tmdbId,
-      deadlineReached,
-      addonResults,
-    },
+    return {
+      streams,
+      stats: {
+        addonsQueried: config.addons.length,
+        addonsSucceeded,
+        rawCount: rawStreams.length,
+        finalCount: streams.length,
+        canonicalTitles: canonicalMeta.canonicalTitles,
+        canonicalYear: canonicalMeta.year,
+        imdbId: canonicalMeta.imdbId,
+        tmdbId: canonicalMeta.tmdbId,
+        deadlineReached,
+        addonResults,
+      },
+    };
   };
+
+  if (!useGlobalCoalescing) {
+    return executePipeline();
+  }
+
+  const flightPromise = executePipeline()
+    .then((result) => {
+      if (result.streams.length > 0) {
+        if (aggregatedResponseCache.size >= RESPONSE_CACHE_MAX_ENTRIES && !aggregatedResponseCache.has(flightKey)) {
+          const oldest = aggregatedResponseCache.keys().next().value;
+          if (oldest) aggregatedResponseCache.delete(oldest);
+        }
+        aggregatedResponseCache.set(flightKey, { result, cachedAt: Date.now() });
+      }
+      return result;
+    })
+    .finally(() => {
+      inFlightPipelines.delete(flightKey);
+    });
+
+  inFlightPipelines.set(flightKey, flightPromise);
+  return flightPromise;
 }

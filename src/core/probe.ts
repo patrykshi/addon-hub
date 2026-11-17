@@ -72,9 +72,32 @@ export function parseUpstreamManifest(
   };
 }
 
+const PROBE_CACHE_TTL_MS = 5 * 60 * 1000;
+const probeResultCache = new Map<string, { result: ManifestProbeResult; cachedAt: number }>();
+const inFlightProbes = new Map<string, Promise<ManifestProbeResult>>();
+
+function getCachedProbe(normalizedUrl: string, now = Date.now()): ManifestProbeResult | undefined {
+  const entry = probeResultCache.get(normalizedUrl);
+  if (!entry) return undefined;
+  if (now - entry.cachedAt > PROBE_CACHE_TTL_MS) {
+    probeResultCache.delete(normalizedUrl);
+    return undefined;
+  }
+  return entry.result;
+}
+
+function setCachedProbe(normalizedUrl: string, result: ManifestProbeResult, now = Date.now()): void {
+  if (probeResultCache.size >= 500 && !probeResultCache.has(normalizedUrl)) {
+    const oldest = probeResultCache.keys().next().value;
+    if (oldest) probeResultCache.delete(oldest);
+  }
+  probeResultCache.set(normalizedUrl, { result, cachedAt: now });
+}
+
 export async function probeAddonManifest(
   rawUrl: string,
   timeoutMs = 5000,
+  forceRefresh = false,
 ): Promise<ManifestProbeResult> {
   const startedAt = Date.now();
   let normalizedUrl: string;
@@ -90,58 +113,94 @@ export async function probeAddonManifest(
     };
   }
 
-  try {
-    const { data } = await fetchWithFallback(normalizedUrl, timeoutMs);
-
-    let payload = data;
-    if (typeof payload === 'string') {
-      try {
-        payload = JSON.parse(payload);
-      } catch {
-        payload = null;
-      }
+  if (!forceRefresh) {
+    const cached = getCachedProbe(normalizedUrl);
+    if (cached) {
+      return cached;
     }
+    const existing = inFlightProbes.get(normalizedUrl);
+    if (existing) {
+      return existing;
+    }
+  }
 
-    const parsed = parseUpstreamManifest(payload, normalizedUrl);
-    const latencyMs = Date.now() - startedAt;
+  const probePromise = (async (): Promise<ManifestProbeResult> => {
+    try {
+      const { data } = await fetchWithFallback(normalizedUrl, timeoutMs);
 
-    if (!parsed.valid) {
+      let payload = data;
+      if (typeof payload === 'string') {
+        try {
+          payload = JSON.parse(payload);
+        } catch {
+          payload = null;
+        }
+      }
+
+      const parsed = parseUpstreamManifest(payload, normalizedUrl);
+      const latencyMs = Date.now() - startedAt;
+
+      if (!parsed.valid) {
+        return {
+          url: normalizedUrl,
+          active: false,
+          error: 'Manifesto Stremio inválido',
+          latencyMs,
+        };
+      }
+
+      const okResult: ManifestProbeResult = {
+        url: normalizedUrl,
+        active: true,
+        name: parsed.name,
+        logo: parsed.logo,
+        version: parsed.version,
+        description: parsed.description,
+        latencyMs,
+      };
+      setCachedProbe(normalizedUrl, okResult);
+      return okResult;
+    } catch (error) {
+      const latencyMs = Date.now() - startedAt;
+      let errorMessage = 'Inacessível';
+
+      if (axios.isAxiosError(error)) {
+        if (error.code === 'ECONNABORTED') {
+          errorMessage = 'Timeout';
+        } else if (error.response?.status) {
+          errorMessage = `HTTP ${error.response.status}`;
+        } else if (error.code) {
+          errorMessage = error.code;
+        }
+      }
+
       return {
         url: normalizedUrl,
         active: false,
-        error: 'Manifesto Stremio inválido',
+        error: errorMessage,
         latencyMs,
       };
+    } finally {
+      inFlightProbes.delete(normalizedUrl);
     }
+  })();
 
-    return {
-      url: normalizedUrl,
-      active: true,
-      name: parsed.name,
-      logo: parsed.logo,
-      version: parsed.version,
-      description: parsed.description,
-      latencyMs,
-    };
-  } catch (error) {
-    const latencyMs = Date.now() - startedAt;
-    let errorMessage = 'Inacessível';
-
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        errorMessage = 'Timeout';
-      } else if (error.response?.status) {
-        errorMessage = `HTTP ${error.response.status}`;
-      } else if (error.code) {
-        errorMessage = error.code;
-      }
-    }
-
-    return {
-      url: normalizedUrl,
-      active: false,
-      error: errorMessage,
-      latencyMs,
-    };
+  if (!forceRefresh) {
+    inFlightProbes.set(normalizedUrl, probePromise);
   }
+  return probePromise;
+}
+
+export async function probeManyAddonManifests(
+  urls: string[],
+  timeoutMs = 5000,
+  forceRefresh = false,
+): Promise<ManifestProbeResult[]> {
+  const uniqueUrls = Array.from(
+    new Set(urls.map((u) => (typeof u === 'string' ? u.trim() : '')).filter(Boolean)),
+  ).slice(0, 40);
+
+  return Promise.all(
+    uniqueUrls.map((url) => probeAddonManifest(url, timeoutMs, forceRefresh)),
+  );
 }

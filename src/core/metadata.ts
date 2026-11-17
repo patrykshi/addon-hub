@@ -204,6 +204,8 @@ export function buildIdBridgeCandidates(
   return { primaryId, alternateIds, cacheIds };
 }
 
+const inFlightMetadata = new Map<string, Promise<CanonicalMetadata>>();
+
 export async function fetchCanonicalMetadata(
   type: string,
   cleanId: string,
@@ -218,15 +220,23 @@ export async function fetchCanonicalMetadata(
     return cached;
   }
 
-  const canonicalTitles: string[] = [];
-  let year: number | undefined;
-  let resolvedImdbId = cleanId.startsWith('tt') ? cleanId : '';
-  let resolvedTmdbId = cleanId.startsWith('tmdb:')
-    ? cleanId.replace(/^tmdb:/i, '').trim()
-    : undefined;
+  if (cache === globalMetadataCache) {
+    const existingFlight = inFlightMetadata.get(cacheKey);
+    if (existingFlight) {
+      return existingFlight;
+    }
+  }
 
-  const cinemetaType = type === 'anime' ? 'series' : type;
-  const tasks: Promise<void>[] = [];
+  const runLookup = async (): Promise<CanonicalMetadata> => {
+    const canonicalTitles: string[] = [];
+    let year: number | undefined;
+    let resolvedImdbId = cleanId.startsWith('tt') ? cleanId : '';
+    let resolvedTmdbId = cleanId.startsWith('tmdb:')
+      ? cleanId.replace(/^tmdb:/i, '').trim()
+      : undefined;
+
+    const cinemetaType = type === 'anime' ? 'series' : type;
+    const tasks: Promise<void>[] = [];
 
   if (cleanId.startsWith('tt')) {
     tasks.push(
@@ -372,20 +382,31 @@ export async function fetchCanonicalMetadata(
     );
   }
 
-  await Promise.allSettled(tasks);
+    await Promise.allSettled(tasks);
 
-  const result: CanonicalMetadata = {
-    imdbId: resolvedImdbId || cleanId,
-    tmdbId: resolvedTmdbId,
-    type,
-    canonicalTitles,
-    year,
-    fetchedAt: Date.now(),
+    const result: CanonicalMetadata = {
+      imdbId: resolvedImdbId || cleanId,
+      tmdbId: resolvedTmdbId,
+      type,
+      canonicalTitles,
+      year,
+      fetchedAt: Date.now(),
+    };
+
+    if (canonicalTitles.length > 0 || year !== undefined || resolvedTmdbId || resolvedImdbId.startsWith('tt')) {
+      cache.set(cacheKey, result);
+    }
+
+    return result;
   };
 
-  if (canonicalTitles.length > 0 || year !== undefined || resolvedTmdbId || resolvedImdbId.startsWith('tt')) {
-    cache.set(cacheKey, result);
+  if (cache !== globalMetadataCache) {
+    return runLookup();
   }
 
-  return result;
+  const promise = runLookup().finally(() => {
+    inFlightMetadata.delete(cacheKey);
+  });
+  inFlightMetadata.set(cacheKey, promise);
+  return promise;
 }

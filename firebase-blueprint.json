@@ -1,0 +1,140 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Private user account metadata and default profile reference.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 320
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "defaultProfileId": {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "displayName", "createdAt", "updatedAt"]
+    },
+    "UserSecret": {
+      "title": "UserSecret",
+      "description": "Owner-only secret storage for optional user API keys (e.g., TMDB v3 key).",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "tmdbApiKey": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "tmdbApiKey", "updatedAt"]
+    },
+    "StreamProfile": {
+      "title": "StreamProfile",
+      "description": "Saved Nuvio/Stremio addon aggregator configuration referenced by unguessable profileId.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "addons": {
+          "type": "array",
+          "description": "Bounded list of upstream Stremio addon entries (max 40)."
+        },
+        "resolutions": {
+          "type": "array",
+          "description": "Allowed resolutions subset from 2160p, 1080p, 720p, 480p."
+        },
+        "allowUnknownRes": {
+          "type": "boolean"
+        },
+        "languageMode": {
+          "type": "string",
+          "enum": ["prioritize_ptbr", "only_ptbr", "none"]
+        },
+        "strictMetaMatch": {
+          "type": "boolean"
+        },
+        "timeoutMs": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "addons",
+        "resolutions",
+        "allowUnknownRes",
+        "languageMode",
+        "strictMetaMatch",
+        "timeoutMs",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Private user account document (PII isolated to account owner)."
+    },
+    "/users/{userId}/secrets/{secretId}": {
+      "schema": { "$ref": "#/entities/UserSecret" },
+      "description": "Private owner-only API key settings such as optional TMDB API key."
+    },
+    "/profiles/{profileId}": {
+      "schema": { "$ref": "#/entities/StreamProfile" },
+      "description": "Saved StreamHub Lite configuration profile (no PII or API secrets) used by /p/{profileId}/manifest.json."
+    }
+  }
+}

@@ -6,12 +6,14 @@ import {
   Loader2,
   Plus,
   RefreshCw,
+  SlidersHorizontal,
   Trash2,
 } from 'lucide-react';
 import {
   ADDON_PRESETS,
   extractAddonDisplayName,
   normalizeManifestUrl,
+  prepareUpdatedAddonEntry,
   type AddonEntry,
   type AddonPreset,
 } from '../core/config.ts';
@@ -29,6 +31,7 @@ interface AddonManagerProps {
   addons: AddonEntry[];
   probeMap: Record<string, AddonProbeState>;
   onAddAddon: (addon: AddonEntry, hasCustomName?: boolean) => void;
+  onUpdateAddon: (oldUrl: string, updated: AddonEntry, hasCustomName?: boolean) => void;
   onRemoveAddon: (url: string) => void;
   onRefreshAddon: (url: string) => void;
   onRefreshAll: () => void;
@@ -45,6 +48,7 @@ export const AddonManager: React.FC<AddonManagerProps> = ({
   addons,
   probeMap,
   onAddAddon,
+  onUpdateAddon,
   onRemoveAddon,
   onRefreshAddon,
   onRefreshAll,
@@ -53,6 +57,10 @@ export const AddonManager: React.FC<AddonManagerProps> = ({
   const [nameInput, setNameInput] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
   const [brokenLogos, setBrokenLogos] = useState<Record<string, boolean>>({});
+  const [editingUrl, setEditingUrl] = useState<string | null>(null);
+  const [editUrlValue, setEditUrlValue] = useState('');
+  const [editNameValue, setEditNameValue] = useState('');
+  const [editError, setEditError] = useState('');
 
   const isPresetAdded = (presetUrl: string): boolean => {
     try {
@@ -101,6 +109,45 @@ export const AddonManager: React.FC<AddonManagerProps> = ({
       setNameInput('');
     } catch (err) {
       setErrorMessage(
+        err instanceof Error ? err.message : 'Informe uma URL válida de manifest.json.',
+      );
+    }
+  };
+
+  const handleOpenEdit = (addon: AddonEntry) => {
+    if (editingUrl === addon.url) {
+      setEditingUrl(null);
+      setEditError('');
+      return;
+    }
+    setEditingUrl(addon.url);
+    setEditUrlValue(addon.url);
+    setEditNameValue(addon.name);
+    setEditError('');
+  };
+
+  const handleCancelEdit = () => {
+    setEditingUrl(null);
+    setEditError('');
+  };
+
+  const handleSaveEdit = (event: React.FormEvent, addon: AddonEntry) => {
+    event.preventDefault();
+    setEditError('');
+
+    try {
+      const updated = prepareUpdatedAddonEntry(
+        addons,
+        addon.url,
+        editUrlValue,
+        editNameValue,
+      );
+      const trimmedName = editNameValue.trim();
+      const hasCustomName = Boolean(trimmedName) && trimmedName !== addon.name;
+      onUpdateAddon(addon.url, updated, hasCustomName);
+      setEditingUrl(null);
+    } catch (err) {
+      setEditError(
         err instanceof Error ? err.message : 'Informe uma URL válida de manifest.json.',
       );
     }
@@ -242,7 +289,7 @@ export const AddonManager: React.FC<AddonManagerProps> = ({
           </div>
         ) : (
           <ul className="divide-y divide-white/[0.06]">
-            {addons.map((addon) => {
+            {addons.map((addon, idx) => {
               const probe = probeMap[addon.url];
               const status = probe?.status ?? 'checking';
               const displayName = addon.name || probe?.manifestName || 'Addon';
@@ -252,132 +299,233 @@ export const AddonManager: React.FC<AddonManagerProps> = ({
                   : undefined;
               const logoUrl = probe?.logo || addon.logo;
               const showLogoImage = Boolean(logoUrl) && !brokenLogos[logoUrl!];
+              const isEditing = editingUrl === addon.url;
+              const editUrlInputId = `edit-addon-url-${idx}`;
+              const editNameInputId = `edit-addon-name-${idx}`;
 
               return (
                 <li
                   key={addon.url}
-                  className="flex items-center justify-between gap-3.5 py-3.5 first:pt-1 last:pb-1"
+                  className="py-3.5 first:pt-1 last:pb-1"
                 >
-                  {/* Imagem do addon (logo do manifesto ou monograma fallback) */}
-                  <div className="h-10 w-10 shrink-0 overflow-hidden rounded-lg border border-white/[0.08] bg-[#0B0F17] flex items-center justify-center">
-                    {showLogoImage ? (
-                      <img
-                        src={logoUrl}
-                        alt={`Logo de ${displayName}`}
-                        referrerPolicy="no-referrer"
-                        onError={() =>
-                          setBrokenLogos((prev) => ({
-                            ...prev,
-                            [logoUrl!]: true,
-                          }))
-                        }
-                        className="h-full w-full object-contain p-1"
-                      />
-                    ) : (
-                      <span
-                        aria-hidden="true"
-                        className="font-display text-xs font-semibold tracking-wide text-slate-300"
-                      >
-                        {getInitials(displayName)}
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Nome próprio, status (Ativo / Inativo) e URL */}
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
-                      <span className="truncate text-sm font-semibold text-slate-100">
-                        {displayName}
-                      </span>
-
-                      {manifestOwnName && (
-                        <>
-                          <span aria-hidden="true" className="text-slate-600 text-xs">
-                            ·
-                          </span>
-                          <span className="truncate text-xs text-slate-400">
-                            {manifestOwnName}
-                          </span>
-                        </>
-                      )}
-
-                      <span aria-hidden="true" className="text-slate-600 text-xs">
-                        ·
-                      </span>
-
-                      {/* Símbolo de status: Ativo / Inativo / Verificando */}
-                      {status === 'active' && (
-                        <span
-                          className="inline-flex items-center gap-1 text-xs font-medium text-emerald-400 whitespace-nowrap"
-                          title={
-                            probe?.latencyMs !== undefined
-                              ? `Manifesto acessível (${probe.latencyMs} ms)`
-                              : 'Manifesto acessível'
+                  <div className="flex items-center justify-between gap-3.5">
+                    {/* Imagem do addon (logo do manifesto ou monograma fallback) */}
+                    <div className="h-10 w-10 shrink-0 overflow-hidden rounded-lg border border-white/[0.08] bg-[#0B0F17] flex items-center justify-center">
+                      {showLogoImage ? (
+                        <img
+                          src={logoUrl}
+                          alt={`Logo de ${displayName}`}
+                          referrerPolicy="no-referrer"
+                          onError={() =>
+                            setBrokenLogos((prev) => ({
+                              ...prev,
+                              [logoUrl!]: true,
+                            }))
                           }
-                        >
-                          <CheckCircle2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                          <span>Ativo</span>
-                          {probe?.version && (
-                            <span className="font-mono text-[11px] text-slate-500">
-                              v{probe.version}
-                            </span>
-                          )}
-                        </span>
-                      )}
-
-                      {status === 'inactive' && (
+                          className="h-full w-full object-contain p-1"
+                        />
+                      ) : (
                         <span
-                          className="inline-flex items-center gap-1 text-xs font-medium text-red-400 whitespace-nowrap"
-                          title={probe?.error || 'Não foi possível carregar o manifest.json'}
+                          aria-hidden="true"
+                          className="font-display text-xs font-semibold tracking-wide text-slate-300"
                         >
-                          <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                          <span>Inativo</span>
-                          {probe?.error && (
-                            <span className="text-[11px] text-red-300/80">
-                              ({probe.error})
-                            </span>
-                          )}
-                        </span>
-                      )}
-
-                      {status === 'checking' && (
-                        <span className="inline-flex items-center gap-1 text-xs font-medium text-slate-400 whitespace-nowrap">
-                          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" aria-hidden="true" />
-                          <span>Verificando...</span>
+                          {getInitials(displayName)}
                         </span>
                       )}
                     </div>
 
-                    <p className="mt-0.5 truncate font-mono text-xs text-slate-400">
-                      {addon.url}
-                    </p>
+                    {/* Nome próprio, status (Ativo / Inativo) e URL */}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                        <span className="truncate text-sm font-semibold text-slate-100">
+                          {displayName}
+                        </span>
+
+                        {manifestOwnName && (
+                          <>
+                            <span aria-hidden="true" className="text-slate-600 text-xs">
+                              ·
+                            </span>
+                            <span className="truncate text-xs text-slate-400">
+                              {manifestOwnName}
+                            </span>
+                          </>
+                        )}
+
+                        <span aria-hidden="true" className="text-slate-600 text-xs">
+                          ·
+                        </span>
+
+                        {/* Símbolo de status: Ativo / Inativo / Verificando */}
+                        {status === 'active' && (
+                          <span
+                            className="inline-flex items-center gap-1 text-xs font-medium text-emerald-400 whitespace-nowrap"
+                            title={
+                              probe?.latencyMs !== undefined
+                                ? `Manifesto acessível (${probe.latencyMs} ms)`
+                                : 'Manifesto acessível'
+                            }
+                          >
+                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                            <span>Ativo</span>
+                            {probe?.version && (
+                              <span className="font-mono text-[11px] text-slate-500">
+                                v{probe.version}
+                              </span>
+                            )}
+                          </span>
+                        )}
+
+                        {status === 'inactive' && (
+                          <span
+                            className="inline-flex items-center gap-1 text-xs font-medium text-red-400 whitespace-nowrap"
+                            title={probe?.error || 'Não foi possível carregar o manifest.json'}
+                          >
+                            <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                            <span>Inativo</span>
+                            {probe?.error && (
+                              <span className="text-[11px] text-red-300/80">
+                                ({probe.error})
+                              </span>
+                            )}
+                          </span>
+                        )}
+
+                        {status === 'checking' && (
+                          <span className="inline-flex items-center gap-1 text-xs font-medium text-slate-400 whitespace-nowrap">
+                            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" aria-hidden="true" />
+                            <span>Verificando...</span>
+                          </span>
+                        )}
+                      </div>
+
+                      <p className="mt-0.5 truncate font-mono text-xs text-slate-400">
+                        {addon.url}
+                      </p>
+                    </div>
+
+                    {/* Ações individuais */}
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleOpenEdit(addon)}
+                        aria-expanded={isEditing}
+                        aria-label={`Configurar ${displayName}`}
+                        title={`Configurar ${displayName}`}
+                        className={`flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer ${
+                          isEditing
+                            ? 'border-blue-500/40 bg-blue-500/15 text-blue-300'
+                            : status === 'inactive'
+                              ? 'border-amber-500/30 bg-amber-500/10 text-amber-300 hover:border-amber-400/50 hover:text-amber-200'
+                              : 'border-transparent text-slate-400 hover:border-white/[0.1] hover:bg-white/[0.04] hover:text-slate-200'
+                        }`}
+                      >
+                        <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => onRefreshAddon(addon.url)}
+                        disabled={status === 'checking'}
+                        aria-label={`Verificar status de ${displayName}`}
+                        title={`Verificar status de ${displayName}`}
+                        className="flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg border border-transparent text-slate-400 transition-colors hover:border-white/[0.1] hover:bg-white/[0.04] hover:text-slate-200 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
+                      >
+                        <RefreshCw
+                          className={`h-4 w-4 ${status === 'checking' ? 'animate-spin' : ''}`}
+                          aria-hidden="true"
+                        />
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (isEditing) setEditingUrl(null);
+                          onRemoveAddon(addon.url);
+                        }}
+                        aria-label={`Remover ${displayName}`}
+                        className="flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg border border-transparent text-slate-400 transition-colors hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 cursor-pointer"
+                      >
+                        <Trash2 className="h-4 w-4" aria-hidden="true" />
+                      </button>
+                    </div>
                   </div>
 
-                  {/* Ações individuais */}
-                  <div className="flex items-center gap-1 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => onRefreshAddon(addon.url)}
-                      disabled={status === 'checking'}
-                      aria-label={`Verificar status de ${displayName}`}
-                      title={`Verificar status de ${displayName}`}
-                      className="flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg border border-transparent text-slate-400 transition-colors hover:border-white/[0.1] hover:bg-white/[0.04] hover:text-slate-200 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
+                  {isEditing && (
+                    <form
+                      onSubmit={(e) => handleSaveEdit(e, addon)}
+                      noValidate
+                      className="mt-3.5 border-t border-white/[0.06] pt-3.5 pl-0 sm:pl-[54px] space-y-3"
                     >
-                      <RefreshCw
-                        className={`h-4 w-4 ${status === 'checking' ? 'animate-spin' : ''}`}
-                        aria-hidden="true"
-                      />
-                    </button>
+                      {status === 'inactive' && (
+                        <p className="text-xs text-amber-300/90">
+                          Addon inativo{probe?.error ? ` (${probe.error})` : ''}. Atualize a URL HTTPS abaixo e salve para reverificar automaticamente.
+                        </p>
+                      )}
 
-                    <button
-                      type="button"
-                      onClick={() => onRemoveAddon(addon.url)}
-                      aria-label={`Remover ${displayName}`}
-                      className="flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg border border-transparent text-slate-400 transition-colors hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 cursor-pointer"
-                    >
-                      <Trash2 className="h-4 w-4" aria-hidden="true" />
-                    </button>
-                  </div>
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
+                        <div className="sm:col-span-8">
+                          <label
+                            htmlFor={editUrlInputId}
+                            className="block text-xs font-medium text-slate-300 mb-1.5"
+                          >
+                            URL do manifest.json (HTTPS)
+                          </label>
+                          <input
+                            id={editUrlInputId}
+                            type="url"
+                            value={editUrlValue}
+                            onChange={(e) => {
+                              setEditUrlValue(e.target.value);
+                              if (editError) setEditError('');
+                            }}
+                            placeholder="https://addon.exemplo/manifest.json"
+                            className="w-full min-h-[42px] rounded-lg border border-white/[0.12] bg-[#0B0F17] px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          />
+                        </div>
+
+                        <div className="sm:col-span-4">
+                          <label
+                            htmlFor={editNameInputId}
+                            className="block text-xs font-medium text-slate-300 mb-1.5"
+                          >
+                            Nome do addon
+                          </label>
+                          <input
+                            id={editNameInputId}
+                            type="text"
+                            value={editNameValue}
+                            onChange={(e) => setEditNameValue(e.target.value)}
+                            maxLength={32}
+                            placeholder="Ex: Torrentio"
+                            className="w-full min-h-[42px] rounded-lg border border-white/[0.12] bg-[#0B0F17] px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          />
+                        </div>
+                      </div>
+
+                      {editError && (
+                        <p role="alert" className="text-xs font-medium text-red-400">
+                          {editError}
+                        </p>
+                      )}
+
+                      <div className="flex flex-wrap items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={handleCancelEdit}
+                          className="min-h-[40px] rounded-lg border border-white/[0.1] px-4 py-2 text-xs font-medium text-slate-300 transition-colors hover:border-white/20 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 whitespace-nowrap cursor-pointer"
+                        >
+                          Cancelar
+                        </button>
+                        <button
+                          type="submit"
+                          className="min-h-[40px] rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 whitespace-nowrap cursor-pointer"
+                        >
+                          Salvar e reverificar
+                        </button>
+                      </div>
+                    </form>
+                  )}
                 </li>
               );
             })}
